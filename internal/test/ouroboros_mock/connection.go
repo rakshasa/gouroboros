@@ -187,8 +187,15 @@ func (c *Connection) processInputEntry(entry ConversationEntry) error {
 		if msg == nil {
 			return fmt.Errorf("received unknown message type: %d", msgType)
 		}
-		// Set CBOR for expected message to match received to make comparison easier
-		entry.InputMessage.SetCbor(msg.Cbor())
+
+		// We don't want to compare the cbor content, so before we call DeepEqual we need to set the
+		// cbor content equal to each other
+		//
+		// We cannot change the CBOR for conversation entry's message as it is not thread-safe, so
+		// instead we change the locally read message before calling DeepEqual
+		msgCbor := msg.Cbor()
+		msg.ClearCbor()
+
 		// Compare received message to expected message
 		if !reflect.DeepEqual(msg, entry.InputMessage) {
 			return fmt.Errorf(
@@ -197,6 +204,7 @@ func (c *Connection) processInputEntry(entry ConversationEntry) error {
 				entry.InputMessage,
 			)
 		}
+		msg.SetCbor(msgCbor)
 	} else {
 		if entry.InputMessageType == uint(msgType) {
 			return nil
