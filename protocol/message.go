@@ -16,6 +16,7 @@ package protocol
 
 // Message provides a common interface for message utility functions
 type Message interface {
+	ClearCbor()
 	SetCbor([]byte)
 	Cbor() []byte
 	Type() uint8
@@ -27,6 +28,11 @@ type MessageBase struct {
 	_           struct{} `cbor:",toarray"`
 	rawCbor     []byte
 	MessageType uint8
+}
+
+// ClearCbor removes the original CBOR that was parsed
+func (m *MessageBase) ClearCbor() {
+	m.rawCbor = nil
 }
 
 // SetCbor stores the original CBOR that was parsed
