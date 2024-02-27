@@ -37,7 +37,15 @@ type Client struct {
 	firstBlockChan        chan common.Point
 	wantIntersectPoint    bool
 	intersectPointChan    chan common.Point
-	onceStop              sync.Once
+
+	// New fields
+	handleMessageChan chan<- clientMessage
+	requestStopChan   chan chan<- error
+}
+
+type clientMessage struct {
+	message   protocol.Message
+	errorChan chan<- error
 }
 
 // NewClient returns a new ChainSync client object
@@ -54,6 +62,7 @@ func NewClient(protoOptions protocol.ProtocolOptions, cfg *Config) *Client {
 		tmpCfg := NewConfig()
 		cfg = &tmpCfg
 	}
+
 	c := &Client{
 		config:                cfg,
 		intersectResultChan:   make(chan error),
@@ -61,6 +70,7 @@ func NewClient(protoOptions protocol.ProtocolOptions, cfg *Config) *Client {
 		currentTipChan:        make(chan Tip),
 		firstBlockChan:        make(chan common.Point),
 		intersectPointChan:    make(chan common.Point),
+		requestStopChan:       make(chan chan<- error),
 	}
 	// Update state map with timeouts
 	stateMap := StateMap.Copy()
@@ -88,53 +98,33 @@ func NewClient(protoOptions protocol.ProtocolOptions, cfg *Config) *Client {
 		InitialState:        stateIdle,
 	}
 	c.Protocol = protocol.New(protoConfig)
-	// Start goroutine to cleanup resources on protocol shutdown
-	go func() {
-		<-c.Protocol.DoneChan()
-		close(c.intersectResultChan)
-		close(c.readyForNextBlockChan)
-		close(c.currentTipChan)
-		close(c.firstBlockChan)
-		close(c.intersectPointChan)
-	}()
+
+	handleMessageChan := make(chan clientMessage)
+	c.handleMessageChan = handleMessageChan
+
+	go c.clientLoop(handleMessageChan)
+
 	return c
 }
 
+// messageHandler handles incoming messages from the protocol. It is called from the underlying
+// protocol and is blocking.
 func (c *Client) messageHandler(msg protocol.Message) error {
-	var err error
-	switch msg.Type() {
-	case MessageTypeAwaitReply:
-		err = c.handleAwaitReply()
-	case MessageTypeRollForward:
-		err = c.handleRollForward(msg)
-	case MessageTypeRollBackward:
-		err = c.handleRollBackward(msg)
-	case MessageTypeIntersectFound:
-		err = c.handleIntersectFound(msg)
-	case MessageTypeIntersectNotFound:
-		err = c.handleIntersectNotFound(msg)
-	default:
-		err = fmt.Errorf(
-			"%s: received unexpected message type %d",
-			ProtocolName,
-			msg.Type(),
-		)
-	}
-	return err
+	errorChan := make(chan error, 1)
+	c.handleMessageChan <- clientMessage{message: msg, errorChan: errorChan}
+	return <-errorChan
 }
 
 // Stop transitions the protocol to the Done state. No more protocol operations will be possible afterward
 func (c *Client) Stop() error {
-	var err error
-	c.onceStop.Do(func() {
-		c.busyMutex.Lock()
-		defer c.busyMutex.Unlock()
-		msg := NewMsgDone()
-		if err = c.SendMessage(msg); err != nil {
-			return
-		}
-	})
-	return err
+	errorChan := make(chan error, 1)
+
+	select {
+	case c.requestStopChan <- errorChan:
+		return <-errorChan
+	default:
+		return nil
+	}
 }
 
 // GetCurrentTip returns the current chain tip
@@ -284,6 +274,93 @@ func (c *Client) syncLoop() {
 			return
 		}
 		c.busyMutex.Unlock()
+	}
+}
+
+// clientLoop is the main loop for the client.
+//
+// We're rewriting the client to use a single loop to handle all incoming messages, this will use golang channels
+//
+// Seems the public functions use busyMutex to protect the client from concurrent access
+//
+// However the message handlers are not protected by busyMutex, so we need to figure out what
+// variables are shared between the two
+
+func (c *Client) clientLoop(handleMessageChan <-chan clientMessage) {
+	messageHandlerDoneChan := make(chan struct{})
+	go c.messageHandlerLoop(handleMessageChan, messageHandlerDoneChan)
+
+	requestStopChan := c.requestStopChan
+
+	for {
+		select {
+		case ch := <-requestStopChan:
+			// Consider the need for graceful shutdown handling, e.g. waiting for all messages to be
+			// processed vs. interrupting the mesage handler immediately
+			//
+			// The interrupting variant is implemented here, but the graceful variant would be in
+			// the meessageHandlerLoop
+
+			// Stop() as previous implemented was a graceful shutdown (mutex amongst public methods), so change to that?
+
+			// Only handle stop once
+			requestStopChan = nil
+
+			msg := NewMsgDone()
+			ch <- c.SendMessage(msg)
+
+		case <-messageHandlerDoneChan:
+			close(c.intersectResultChan)
+			close(c.readyForNextBlockChan)
+			close(c.currentTipChan)
+			close(c.firstBlockChan)
+			close(c.intersectPointChan)
+			return
+		}
+	}
+}
+
+// fix the shutdown sequence, clientLoop should wait for messageHandlerLoop
+
+func (c *Client) messageHandlerLoop(handleMessageChan <-chan clientMessage, doneChan chan<- struct{}) {
+	for {
+		select {
+		case <-c.Protocol.DoneChan():
+			// TODO: Handle this more gracefully, check if we should clean up anything else
+			close(doneChan)
+
+			// Handle any remaining messages so they don't block, and let the GC clean up this
+			// loop. This is strictly not necessary, however future changes might cause issues.
+			for {
+				msg := <-handleMessageChan
+				msg.errorChan <- protocol.ProtocolShuttingDownError
+			}
+
+		case msg := <-handleMessageChan:
+			// TODO: Replace the 'want' variables with channel arrays.
+			// consider passing them as a struct
+
+			msg.errorChan <- func() error {
+				switch msg.message.Type() {
+				case MessageTypeAwaitReply:
+					return c.handleAwaitReply()
+				case MessageTypeRollForward:
+					return c.handleRollForward(msg.message)
+				case MessageTypeRollBackward:
+					return c.handleRollBackward(msg.message)
+				case MessageTypeIntersectFound:
+					return c.handleIntersectFound(msg.message)
+				case MessageTypeIntersectNotFound:
+					return c.handleIntersectNotFound(msg.message)
+				default:
+					return fmt.Errorf(
+						"%s: received unexpected message type %d",
+						ProtocolName,
+						msg.message.Type(),
+					)
+				}
+			}()
+		}
 	}
 }
 
