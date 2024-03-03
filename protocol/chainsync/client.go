@@ -37,10 +37,9 @@ type Client struct {
 	intersectPointChan    chan common.Point
 
 	// New fields
-	handleMessageChan chan<- clientMessage
-	gracefulStopChan  chan chan<- error
-
-	// requestCurrentTipChan chan clientRequestCurrentTip
+	handleMessageChan  chan<- clientMessage
+	gracefulStopChan   chan chan<- error
+	immediateStopChan  chan chan<- error
 	wantCurrentTipChan chan chan<- Tip
 }
 
@@ -48,16 +47,6 @@ type clientMessage struct {
 	message   protocol.Message
 	errorChan chan<- error
 }
-
-// type clientRequestCurrentTip struct {
-// 	resultChan chan<- Tip
-// 	errorChan  chan<- error
-// }
-
-// type clientWantCurrentTip struct {
-// 	resultChan chan<- Tip
-// 	errorChan  chan<- error
-// }
 
 // NewClient returns a new ChainSync client object
 func NewClient(protoOptions protocol.ProtocolOptions, cfg *Config) *Client {
@@ -81,8 +70,8 @@ func NewClient(protoOptions protocol.ProtocolOptions, cfg *Config) *Client {
 		firstBlockChan:        make(chan common.Point),
 		intersectPointChan:    make(chan common.Point),
 
-		gracefulStopChan: make(chan chan<- error),
-		// requestCurrentTipChan: make(chan clientRequestCurrentTip, 10),
+		gracefulStopChan:   make(chan chan<- error, 10),
+		immediateStopChan:  make(chan chan<- error, 10),
 		wantCurrentTipChan: make(chan chan<- Tip, 10),
 	}
 	// Update state map with timeouts
@@ -125,15 +114,23 @@ func NewClient(protoOptions protocol.ProtocolOptions, cfg *Config) *Client {
 func (c *Client) messageHandler(msg protocol.Message) error {
 	errorChan := make(chan error, 1)
 	c.handleMessageChan <- clientMessage{message: msg, errorChan: errorChan}
-	return <-errorChan
+
+	select {
+	case <-c.Protocol.DoneChan():
+		return protocol.ProtocolShuttingDownError
+	case err := <-errorChan:
+		return err
+	}
 }
 
-// func (c *Client) wantCurrentTip() (<-chan Tip, <-chan error) {
-// 	resultChan := make(chan Tip, 1)
-// 	errorChan := make(chan error, 1)
-// 	c.wantCurrentTipChan <- clientWantCurrentTip{resultChan: resultChan, errorChan: errorChan}
-// 	return resultChan, errorChan
-// }
+func (c *Client) waitForError(ch <-chan error) error {
+	select {
+	case <-c.Protocol.DoneChan():
+		return protocol.ProtocolShuttingDownError
+	case err := <-ch:
+		return err
+	}
+}
 
 func (c *Client) wantCurrentTip() <-chan Tip {
 	ch := make(chan Tip, 1)
@@ -141,16 +138,26 @@ func (c *Client) wantCurrentTip() <-chan Tip {
 	return ch
 }
 
-// Stop transitions the protocol to the Done state. No more protocol operations will be possible afterward
+// Stop gracefully transitions the protocol to the Done state. No more protocol operations will be
+// possible afterward
 func (c *Client) Stop() error {
 	errorChan := make(chan error, 1)
 	c.gracefulStopChan <- errorChan
-	return <-errorChan
+	return c.waitForError(errorChan)
+}
+
+// Close immediately transitions the protocol to the Done state. No more protocol operations will be
+// possible afterward
+func (c *Client) Close() error {
+	errorChan := make(chan error, 1)
+	c.immediateStopChan <- errorChan
+	return c.waitForError(errorChan)
 }
 
 // GetCurrentTip returns the current chain tip
 func (c *Client) GetCurrentTip() (*Tip, error) {
 	c.busyMutex.Lock()
+	defer c.busyMutex.Unlock()
 
 	resultChan := c.wantCurrentTip()
 	msg := NewMsgFindIntersect([]common.Point{})
@@ -158,8 +165,6 @@ func (c *Client) GetCurrentTip() (*Tip, error) {
 		c.busyMutex.Unlock()
 		return nil, err
 	}
-
-	c.busyMutex.Unlock()
 
 	select {
 	case <-c.Protocol.DoneChan():
@@ -228,6 +233,8 @@ func (c *Client) GetAvailableBlockRange(
 			start = point
 			c.wantFirstBlock = false
 		case <-c.readyForNextBlockChan:
+			// TODO: This doesn't check for true/false, verify if it should?
+
 			// Request the next block
 			msg := NewMsgRequestNext()
 			if err := c.SendMessage(msg); err != nil {
@@ -297,86 +304,93 @@ func (c *Client) syncLoop() {
 
 // clientLoop is the main loop for the client.
 //
-// We're rewriting the client to use a single loop to handle all incoming messages, this will use golang channels
-//
-// Seems the public functions use busyMutex to protect the client from concurrent access
-//
-// However the message handlers are not protected by busyMutex, so we need to figure out what
+// TODO: Seems the public functions use busyMutex to protect the client from concurrent access
+// TODO: However the message handlers are not protected by busyMutex, so we need to figure out what
 // variables are shared between the two
-
 func (c *Client) clientLoop(handleMessageChan <-chan clientMessage) {
 	messageHandlerDoneChan := make(chan struct{})
 	go c.messageHandlerLoop(handleMessageChan, messageHandlerDoneChan)
 
+	defer func() {
+		// We should avoid closing channels, instead they should check done channel.
+		close(c.intersectResultChan)
+		close(c.readyForNextBlockChan)
+		close(c.firstBlockChan)
+		close(c.intersectPointChan)
+
+		// Handle any remaining messages in the channels so they don't block, and let the GC
+		// clean up this loop.
+		for {
+			select {
+			case msg := <-c.immediateStopChan:
+				msg <- nil
+			}
+		}
+	}()
+
 	doneMessageSent := false
 
-	// Likely we need to separate out the requests from the client loop?
-
+	// Likely we need to separate out the requests from the client loop(?)
 	for {
 		select {
-		case ch := <-c.gracefulStopChan:
+		case <-c.Protocol.DoneChan():
+			return
+
+		case <-messageHandlerDoneChan:
+			return
+
+		case ch := <-c.immediateStopChan:
 			// Consider the need for graceful shutdown handling, e.g. waiting for all messages to be
-			// processed vs. interrupting the mesage handler immediately
+			// processed vs. interrupting the message handler immediately
 			//
 			// The interrupting variant is implemented here, but the graceful variant would be in
 			// the meessageHandlerLoop
-
+			//
 			// Stop() as previous implemented was a graceful shutdown (busymutex), so we need to
 			// review the desired shutdown behaviour.
-
 			if !doneMessageSent {
 				// TODO: Add a timeout.
 				doneMessageSent = true
 				msg := NewMsgDone()
 				ch <- c.SendMessage(msg)
 			}
-
-		case <-messageHandlerDoneChan:
-			close(c.intersectResultChan)
-			close(c.readyForNextBlockChan)
-			close(c.firstBlockChan)
-			close(c.intersectPointChan)
-
-			// Handle any remaining messages in the channels so they don't block, and let the GC
-			// clean up this loop.
-			for {
-				select {
-				case msg := <-c.gracefulStopChan:
-					msg <- nil
-				}
-			}
-
-			// case req := <-c.requestCurrentTipChan:
-			// 	c.requestCurrentTip(req)
 		}
 	}
 }
 
-// fix the shutdown sequence, clientLoop should wait for messageHandlerLoop
+func (c *Client) messageHandlerLoop(handleMessageChan <-chan clientMessage, messageHandlerDoneChan chan<- struct{}) {
+	defer func() {
+		close(messageHandlerDoneChan)
 
-func (c *Client) messageHandlerLoop(handleMessageChan <-chan clientMessage, doneChan chan<- struct{}) {
+		// Handle any remaining messages in the channels so they don't block, and let the GC
+		// clean up this loop.
+		for {
+			select {
+			case msg := <-handleMessageChan:
+				msg.errorChan <- protocol.ProtocolShuttingDownError
+			case <-c.wantCurrentTipChan:
+				// The reader of the result channel must also watch protocol.DoneChan() to avoid a
+				// deadlock. We do not close the channels as that complicates select statements with
+				// multiple channels.
+			}
+		}
+	}()
+
 	for {
 		select {
 		case <-c.Protocol.DoneChan():
-			// TODO: Handle this more gracefully, check if we should clean up anything else
-			close(doneChan)
+			return
 
-			// Handle any remaining messages in the channels so they don't block, and let the GC
-			// clean up this loop.
-			for {
-				// TODO: Drain all want channels. (?)
-				select {
-				case msg := <-handleMessageChan:
-					msg.errorChan <- protocol.ProtocolShuttingDownError
-				case <-c.wantCurrentTipChan:
-					// The reader of the result channel must also watch protocol.DoneChan() to avoid a deadlock.
-				}
+		case ch := <-c.gracefulStopChan:
+			err := c.Close()
+			ch <- err
+
+			// Reconsider the error handling here if the current behavior is changed.
+			if err == nil || err == protocol.ProtocolShuttingDownError {
+				return
 			}
 
 		case msg := <-handleMessageChan:
-			// TODO: Replace the 'want' variables with channel arrays.
-			// consider passing them as a struct
-
 			msg.errorChan <- func() error {
 				switch msg.message.Type() {
 				case MessageTypeAwaitReply:
@@ -400,31 +414,6 @@ func (c *Client) messageHandlerLoop(handleMessageChan <-chan clientMessage, done
 		}
 	}
 }
-
-// func (c *Client) requestCurrentTip(req clientRequestCurrentTip) {
-// 	c.busyMutex.Lock()
-// 	defer c.busyMutex.Unlock()
-
-// 	c.wantCurrentTip = true
-// 	msg := NewMsgFindIntersect([]common.Point{})
-// 	if err := c.SendMessage(msg); err != nil {
-// 		req.errorChan <- err
-// 		return
-// 	}
-// 	tip, ok := <-c.currentTipChan
-// 	if !ok {
-// 		req.errorChan <- protocol.ProtocolShuttingDownError
-// 		return
-// 	}
-// 	// Clear out intersect result channel to prevent blocking
-// 	_, ok = <-c.intersectResultChan
-// 	if !ok {
-// 		req.errorChan <- protocol.ProtocolShuttingDownError
-// 		return
-// 	}
-// 	c.wantCurrentTip = false
-// 	req.resultChan <- tip
-// }
 
 func (c *Client) handleAwaitReply() error {
 	return nil
