@@ -138,7 +138,7 @@ func (c *Client) GetCurrentTip() (*Tip, error) {
 	defer c.busyMutex.Unlock()
 
 	result := c.requestFindIntersect([]common.Point{})
-	if result.error != nil {
+	if result.error != nil && result.error != IntersectNotFoundError {
 		return nil, result.error
 	}
 
@@ -154,31 +154,14 @@ func (c *Client) GetAvailableBlockRange(
 	defer c.busyMutex.Unlock()
 	var start, end common.Point
 
-	fmt.Println("GetAvailableBlockRange: waiting for intersect result")
+	fmt.Printf("GetAvailableBlockRange: waiting for intersect result for: %+v\n", intersectPoints)
 
-	intersectResultChan := c.wantIntersectResult()
-
-	for intersectResultChan != nil {
-		// Find our chain intersection
-		msgFindIntersect := NewMsgFindIntersect(intersectPoints)
-		if err := c.SendMessage(msgFindIntersect); err != nil {
-			return start, end, err
-		}
-
-		select {
-		case <-c.Protocol.DoneChan():
-			return start, end, protocol.ProtocolShuttingDownError
-		case result := <-intersectResultChan:
-			if result.error != nil {
-				// TODO: retry on rollback
-				return common.Point{}, common.Point{}, result.error
-			}
-
-			start = result.tip.Point
-			end = result.tip.Point
-			intersectResultChan = nil
-		}
+	result := c.requestFindIntersect(intersectPoints)
+	if result.error != nil {
+		return common.Point{}, common.Point{}, result.error
 	}
+	start = result.point
+	end = result.tip.Point
 
 	// If we're already at the chain tip, return an empty range
 	if start.Slot >= end.Slot {
@@ -222,7 +205,7 @@ func (c *Client) GetAvailableBlockRange(
 		}
 	}
 
-	fmt.Printf("GetAvailableBlockRange: done")
+	fmt.Println("GetAvailableBlockRange: done")
 
 	// If we're already at the chain tip, return an empty range
 	if start.Slot >= end.Slot {
@@ -306,9 +289,9 @@ func (c *Client) requestFindIntersect(intersectPoints []common.Point) clientInte
 	// TODO: Retry on rollback.
 	resultChan := c.wantIntersectResult()
 
-	msg := NewMsgFindIntersect([]common.Point{})
+	msg := NewMsgFindIntersect(intersectPoints)
 	if err := c.SendMessage(msg); err != nil {
-		fmt.Printf("GetCurrentTip: error sending message: %v\n", err)
+		fmt.Printf("requestFindIntersect: error sending message: %v\n", err)
 		return clientIntersectResult{error: err}
 	}
 
@@ -316,7 +299,7 @@ func (c *Client) requestFindIntersect(intersectPoints []common.Point) clientInte
 	case <-c.Protocol.DoneChan():
 		return clientIntersectResult{error: protocol.ProtocolShuttingDownError}
 	case result := <-resultChan:
-		fmt.Printf("GetCurrentTip: received tip: %v %v\n", result.tip.Point.Slot, result.tip.BlockNumber)
+		fmt.Printf("requestFindIntersect: received intersect: %+v - %+v - %v\n", result.tip, result.point, result.error)
 		return result
 	}
 }
