@@ -31,7 +31,6 @@ type Client struct {
 	busyMutex             sync.Mutex
 	readyForNextBlockChan chan bool
 
-	// New fields
 	handleMessageChan       chan<- clientMessage
 	gracefulStopChan        chan chan<- error
 	immediateStopChan       chan chan<- error
@@ -78,17 +77,12 @@ func NewClient(protoOptions protocol.ProtocolOptions, cfg *Config) *Client {
 	c := &Client{
 		config:                cfg,
 		readyForNextBlockChan: make(chan bool),
-
-		gracefulStopChan:  make(chan chan<- error, 10),
-		immediateStopChan: make(chan chan<- error, 10),
+		gracefulStopChan:      make(chan chan<- error, 10),
+		immediateStopChan:     make(chan chan<- error, 10),
 
 		// TODO: We should only have a buffer size of 1 here, and review the protocol to make sure
-		// it always responds to messages. If it doesn't, we should add a timeout to ethe protocol
+		// it always responds to messages. If it doesn't, we should add a timeout to the channels
 		// and error handling in case the node misbehaves.
-		//
-		// TODO: Future changes to request will move all request handling to a request loop, and
-		// thus we can assure that the channel buffers are always empty before the next request is
-		// made.
 		wantFirstBlockChan:      make(chan chan<- clientFirstBlock, 1),
 		wantIntersectResultChan: make(chan chan<- clientIntersectResult, 1),
 		wantRollbackChan:        make(chan chan<- clientRollback, 1),
@@ -383,16 +377,16 @@ func (c *Client) syncLoop() {
 
 // clientLoop is the main loop for the client.
 //
-// TODO: Seems the public functions use busyMutex to protect the client from concurrent access
-// TODO: However the message handlers are not protected by busyMutex, so we need to figure out what
-// variables are shared between the two
+// TODO: Future changes should move all request handling to a request (or client) loop, and wait
+// channel management will be handled there. The request loop will be responsible for keeping track
+// of if we're in a sync loop and optimizing the current tip requests.
 func (c *Client) clientLoop(handleMessageChan <-chan clientMessage) {
 	defer func() {
 		// We should avoid closing channels, instead they should check done channel.
 		close(c.readyForNextBlockChan)
 
-		// Handle any remaining messages in the channels so they don't block, and let the GC
-		// clean up this loop.
+		// Read any remaining messages in the channels so they don't block, and let the GC clean up
+		// this loop.
 		for {
 			select {
 			case msg := <-c.immediateStopChan:
@@ -406,7 +400,6 @@ func (c *Client) clientLoop(handleMessageChan <-chan clientMessage) {
 
 	doneMessageSent := false
 
-	// Likely we need to separate out the requests from the client loop(?)
 	for {
 		select {
 		case <-c.Protocol.DoneChan():
@@ -417,14 +410,6 @@ func (c *Client) clientLoop(handleMessageChan <-chan clientMessage) {
 			return
 
 		case ch := <-c.immediateStopChan:
-			// Consider the need for graceful shutdown handling, e.g. waiting for all messages to be
-			// processed vs. interrupting the message handler immediately
-			//
-			// The interrupting variant is implemented here, but the graceful variant would be in
-			// the meessageHandlerLoop
-			//
-			// Stop() as previous implemented was a graceful shutdown (busymutex), so we need to
-			// review the desired shutdown behaviour.
 			if !doneMessageSent {
 				// TODO: Add a timeout.
 				doneMessageSent = true
@@ -435,12 +420,13 @@ func (c *Client) clientLoop(handleMessageChan <-chan clientMessage) {
 	}
 }
 
+// messageHandlerLoop is responsible for handling messages from the protocol connection.
 func (c *Client) messageHandlerLoop(handleMessageChan <-chan clientMessage, messageHandlerDoneChan chan<- struct{}) {
 	defer func() {
 		close(messageHandlerDoneChan)
 
-		// Handle any remaining messages in the channels so they don't block, and let the GC
-		// clean up this loop.
+		// Read any remaining messages in the channels so they don't block, and let the GC clean up
+		// this loop.
 		for {
 			select {
 			case msg := <-handleMessageChan:
@@ -450,7 +436,7 @@ func (c *Client) messageHandlerLoop(handleMessageChan <-chan clientMessage, mess
 			case <-c.wantIntersectResultChan:
 			case <-c.wantRollbackChan:
 				// The reader of the result channels must also watch protocol.DoneChan() to avoid a
-				// deadlock. We do not close the channels as that complicates select statements with
+				// deadlock. We do not close them as that complicates select statements with
 				// multiple channels.
 			}
 		}
@@ -637,11 +623,7 @@ func (c *Client) handleRollBackward(msg protocol.Message) error {
 	default:
 	}
 
-	switch {
-	case len(c.wantFirstBlockChan) != 0:
-		// Signal that we're ready for the next block
-		c.readyForNextBlockChan <- true
-	default:
+	if len(c.wantFirstBlockChan) == 0 {
 		if c.config.RollBackwardFunc == nil {
 			return fmt.Errorf(
 				"received chain-sync RollBackward message but no callback function is defined",
@@ -659,6 +641,7 @@ func (c *Client) handleRollBackward(msg protocol.Message) error {
 		}
 	}
 
+	c.readyForNextBlockChan <- true
 	return nil
 }
 
