@@ -30,13 +30,12 @@ type Client struct {
 	config                *Config
 	busyMutex             sync.Mutex
 	readyForNextBlockChan chan bool
-	wantFirstBlock        bool
-	firstBlockChan        chan common.Point
 
 	// New fields
 	handleMessageChan       chan<- clientMessage
 	gracefulStopChan        chan chan<- error
 	immediateStopChan       chan chan<- error
+	wantFirstBlockChan      chan chan<- clientFirstBlock
 	wantIntersectResultChan chan chan<- clientIntersectResult
 	wantRollbackChan        chan chan<- clientRollback
 }
@@ -44,6 +43,11 @@ type Client struct {
 type clientMessage struct {
 	message   protocol.Message
 	errorChan chan<- error
+}
+
+type clientFirstBlock struct {
+	point common.Point
+	error error
 }
 
 type clientIntersectResult struct {
@@ -74,12 +78,20 @@ func NewClient(protoOptions protocol.ProtocolOptions, cfg *Config) *Client {
 	c := &Client{
 		config:                cfg,
 		readyForNextBlockChan: make(chan bool),
-		firstBlockChan:        make(chan common.Point),
 
-		gracefulStopChan:        make(chan chan<- error, 10),
-		immediateStopChan:       make(chan chan<- error, 10),
-		wantIntersectResultChan: make(chan chan<- clientIntersectResult, 10),
-		wantRollbackChan:        make(chan chan<- clientRollback, 10),
+		gracefulStopChan:  make(chan chan<- error, 10),
+		immediateStopChan: make(chan chan<- error, 10),
+
+		// TODO: We should only have a buffer size of 1 here, and review the protocol to make sure
+		// it always responds to messages. If it doesn't, we should add a timeout to ethe protocol
+		// and error handling in case the node misbehaves.
+		//
+		// TODO: Future changes to request will move all request handling to a request loop, and
+		// thus we can assure that the channel buffers are always empty before the next request is
+		// made.
+		wantFirstBlockChan:      make(chan chan<- clientFirstBlock, 1),
+		wantIntersectResultChan: make(chan chan<- clientIntersectResult, 1),
+		wantRollbackChan:        make(chan chan<- clientRollback, 1),
 	}
 	// Update state map with timeouts
 	stateMap := StateMap.Copy()
@@ -174,8 +186,17 @@ func (c *Client) GetAvailableBlockRange(
 	// in a rollback.
 	//
 	// TODO: Verify that the rollback always happends, if not review the code here.
-	rollbackChan := c.wantRollback()
-	c.wantFirstBlock = true
+	rollbackChan, cancelRollback := c.wantRollback()
+	firstBlockChan, cancelFirstBlock := c.wantFirstBlock()
+	defer func() {
+		if rollbackChan != nil {
+			cancelRollback()
+		}
+		if firstBlockChan != nil {
+			cancelFirstBlock()
+		}
+	}()
+
 	msgRequestNext := NewMsgRequestNext()
 	if err := c.SendMessage(msgRequestNext); err != nil {
 		return start, end, err
@@ -186,11 +207,14 @@ func (c *Client) GetAvailableBlockRange(
 		case <-c.Protocol.DoneChan():
 			return start, end, protocol.ProtocolShuttingDownError
 		case rollback := <-rollbackChan:
-			end = rollback.tip.Point
 			rollbackChan = nil
-		case point := <-c.firstBlockChan:
-			start = point
-			c.wantFirstBlock = false
+			end = rollback.tip.Point
+		case firstBlock := <-firstBlockChan:
+			if firstBlock.error != nil {
+				return start, end, fmt.Errorf("failed to get first block: %w", firstBlock.error)
+			}
+			firstBlockChan = nil
+			start = firstBlock.point
 		case <-c.readyForNextBlockChan:
 			// TODO: This doesn't check for true/false, verify if it should?
 
@@ -200,7 +224,7 @@ func (c *Client) GetAvailableBlockRange(
 				return start, end, err
 			}
 		}
-		if !c.wantFirstBlock && rollbackChan == nil {
+		if firstBlockChan == nil && rollbackChan == nil {
 			break
 		}
 	}
@@ -232,9 +256,10 @@ func (c *Client) Sync(intersectPoints []common.Point) error {
 		return s
 	}())
 
-	intersectResultChan := c.wantIntersectResult()
+	intersectResultChan, cancel := c.wantIntersectResult()
 	msg := NewMsgFindIntersect(intersectPoints)
 	if err := c.SendMessage(msg); err != nil {
+		cancel()
 		return err
 	}
 
@@ -273,25 +298,54 @@ func (c *Client) waitForError(ch <-chan error) error {
 	}
 }
 
-func (c *Client) wantIntersectResult() <-chan clientIntersectResult {
-	ch := make(chan clientIntersectResult, 1)
-	c.wantIntersectResultChan <- ch
-	return ch
+// want* returns a channel that will receive the result of the next intersect request,
+// and a function that can be used to clear the channel if sending the request message fails.
+//
+// TODO: This is a bit of a hack, and should be replaced with a request loop that manages the
+// request state and channel buffers. This only works correctly when using busyMutex.
+func (c *Client) wantFirstBlock() (<-chan clientFirstBlock, func()) {
+	ch := make(chan clientFirstBlock, 1)
+	c.wantFirstBlockChan <- ch
+	return ch, func() {
+		select {
+		case <-c.wantFirstBlockChan:
+		default:
+		}
+	}
 }
 
-func (c *Client) wantRollback() <-chan clientRollback {
+func (c *Client) wantIntersectResult() (<-chan clientIntersectResult, func()) {
+	ch := make(chan clientIntersectResult, 1)
+	c.wantIntersectResultChan <- ch
+	return ch, func() {
+		select {
+		case <-c.wantIntersectResultChan:
+		default:
+		}
+	}
+}
+
+// wantRollback returns a channel that will receive the result of the next intersect request, and a
+// function that can be used to clear the channel if sending the request message fails.
+func (c *Client) wantRollback() (<-chan clientRollback, func()) {
 	ch := make(chan clientRollback, 1)
 	c.wantRollbackChan <- ch
-	return ch
+	return ch, func() {
+		select {
+		case <-c.wantRollbackChan:
+		default:
+		}
+	}
 }
 
 func (c *Client) requestFindIntersect(intersectPoints []common.Point) clientIntersectResult {
 	// TODO: Retry on rollback.
-	resultChan := c.wantIntersectResult()
+	resultChan, cancel := c.wantIntersectResult()
 
 	msg := NewMsgFindIntersect(intersectPoints)
 	if err := c.SendMessage(msg); err != nil {
 		fmt.Printf("requestFindIntersect: error sending message: %v\n", err)
+		cancel()
 		return clientIntersectResult{error: err}
 	}
 
@@ -333,13 +387,9 @@ func (c *Client) syncLoop() {
 // TODO: However the message handlers are not protected by busyMutex, so we need to figure out what
 // variables are shared between the two
 func (c *Client) clientLoop(handleMessageChan <-chan clientMessage) {
-	messageHandlerDoneChan := make(chan struct{})
-	go c.messageHandlerLoop(handleMessageChan, messageHandlerDoneChan)
-
 	defer func() {
 		// We should avoid closing channels, instead they should check done channel.
 		close(c.readyForNextBlockChan)
-		close(c.firstBlockChan)
 
 		// Handle any remaining messages in the channels so they don't block, and let the GC
 		// clean up this loop.
@@ -351,6 +401,9 @@ func (c *Client) clientLoop(handleMessageChan <-chan clientMessage) {
 		}
 	}()
 
+	messageHandlerDoneChan := make(chan struct{})
+	go c.messageHandlerLoop(handleMessageChan, messageHandlerDoneChan)
+
 	doneMessageSent := false
 
 	// Likely we need to separate out the requests from the client loop(?)
@@ -360,6 +413,7 @@ func (c *Client) clientLoop(handleMessageChan <-chan clientMessage) {
 			return
 
 		case <-messageHandlerDoneChan:
+			// messageHandlerLoop is responsible for the protocol connection being closed.
 			return
 
 		case ch := <-c.immediateStopChan:
@@ -391,8 +445,11 @@ func (c *Client) messageHandlerLoop(handleMessageChan <-chan clientMessage, mess
 			select {
 			case msg := <-handleMessageChan:
 				msg.errorChan <- protocol.ProtocolShuttingDownError
+
+			case <-c.gracefulStopChan:
 			case <-c.wantIntersectResultChan:
-				// The reader of the result channel must also watch protocol.DoneChan() to avoid a
+			case <-c.wantRollbackChan:
+				// The reader of the result channels must also watch protocol.DoneChan() to avoid a
 				// deadlock. We do not close the channels as that complicates select statements with
 				// multiple channels.
 			}
@@ -451,11 +508,23 @@ func (c *Client) handleAwaitReply() error {
 }
 
 func (c *Client) handleRollForward(msgGeneric protocol.Message) error {
-	if (c.config == nil || c.config.RollForwardFunc == nil) && !c.wantFirstBlock {
-		return fmt.Errorf(
-			"received chain-sync RollForward message but no callback function is defined",
-		)
+	firstBlockChan := func() chan<- clientFirstBlock {
+		select {
+		case ch := <-c.wantFirstBlockChan:
+			return ch
+		default:
+			return nil
+		}
+	}()
+
+	if firstBlockChan == nil {
+		if c.config == nil || c.config.RollForwardFunc == nil {
+			return fmt.Errorf(
+				"received chain-sync RollForward message but no callback function is defined",
+			)
+		}
 	}
+
 	var callbackErr error
 	if c.Mode() == protocol.ProtocolModeNodeToNode {
 		msg := msgGeneric.(*MsgRollForwardNtN)
@@ -471,6 +540,9 @@ func (c *Client) handleRollForward(msgGeneric protocol.Message) error {
 				msg.WrappedHeader.HeaderCbor(),
 			)
 			if err != nil {
+				if firstBlockChan != nil {
+					firstBlockChan <- clientFirstBlock{error: err}
+				}
 				return err
 			}
 		default:
@@ -482,35 +554,47 @@ func (c *Client) handleRollForward(msgGeneric protocol.Message) error {
 				msg.WrappedHeader.HeaderCbor(),
 			)
 			if err != nil {
+				if firstBlockChan != nil {
+					firstBlockChan <- clientFirstBlock{error: err}
+				}
 				return err
 			}
 		}
-		if c.wantFirstBlock {
+
+		if firstBlockChan != nil {
 			blockHash, err := hex.DecodeString(blockHeader.Hash())
 			if err != nil {
+				firstBlockChan <- clientFirstBlock{error: err}
 				return err
 			}
 			point := common.NewPoint(blockHeader.SlotNumber(), blockHash)
-			c.firstBlockChan <- point
+			firstBlockChan <- clientFirstBlock{point: point}
 			return nil
 		}
+
 		// Call the user callback function
 		callbackErr = c.config.RollForwardFunc(blockType, blockHeader, msg.Tip)
 	} else {
 		msg := msgGeneric.(*MsgRollForwardNtC)
 		blk, err := ledger.NewBlockFromCbor(msg.BlockType(), msg.BlockCbor())
 		if err != nil {
+			if firstBlockChan != nil {
+				firstBlockChan <- clientFirstBlock{error: err}
+			}
 			return err
 		}
-		if c.wantFirstBlock {
+
+		if firstBlockChan != nil {
 			blockHash, err := hex.DecodeString(blk.Hash())
 			if err != nil {
+				firstBlockChan <- clientFirstBlock{error: err}
 				return err
 			}
 			point := common.NewPoint(blk.SlotNumber(), blockHash)
-			c.firstBlockChan <- point
+			firstBlockChan <- clientFirstBlock{point: point}
 			return nil
 		}
+
 		// Call the user callback function
 		callbackErr = c.config.RollForwardFunc(msg.BlockType(), blk, msg.Tip)
 	}
@@ -540,13 +624,12 @@ func (c *Client) handleRollBackward(msg protocol.Message) error {
 
 	// TODO: Figure out if the previous code was reusing the currentTipChan for multiple purposes,
 	// and use only explicit channels for each purpose.
-	for len(c.wantIntersectResultChan) > 0 {
-		select {
-		case ch := <-c.wantIntersectResultChan:
-			ch <- clientIntersectResult{tip: msgRollBackward.Tip} // err: protocol.ProtocolRollbackError}
-		default:
-		}
-	}
+	//
+	// select {
+	// case ch := <-c.wantIntersectResultChan:
+	// 	ch <- clientIntersectResult{tip: msgRollBackward.Tip} // err: protocol.ProtocolRollbackError}
+	// default:
+	// }
 
 	select {
 	case ch := <-c.wantRollbackChan:
@@ -554,7 +637,11 @@ func (c *Client) handleRollBackward(msg protocol.Message) error {
 	default:
 	}
 
-	if !c.wantFirstBlock {
+	switch {
+	case len(c.wantFirstBlockChan) != 0:
+		// Signal that we're ready for the next block
+		c.readyForNextBlockChan <- true
+	default:
 		if c.config.RollBackwardFunc == nil {
 			return fmt.Errorf(
 				"received chain-sync RollBackward message but no callback function is defined",
@@ -571,22 +658,17 @@ func (c *Client) handleRollBackward(msg protocol.Message) error {
 			}
 		}
 	}
-	// Signal that we're ready for the next block
-	c.readyForNextBlockChan <- true
+
 	return nil
 }
 
 func (c *Client) handleIntersectFound(msg protocol.Message) error {
 	msgIntersectFound := msg.(*MsgIntersectFound)
 
-loop:
-	for {
-		select {
-		case ch := <-c.wantIntersectResultChan:
-			ch <- clientIntersectResult{tip: msgIntersectFound.Tip, point: msgIntersectFound.Point}
-		default:
-			break loop
-		}
+	select {
+	case ch := <-c.wantIntersectResultChan:
+		ch <- clientIntersectResult{tip: msgIntersectFound.Tip, point: msgIntersectFound.Point}
+	default:
 	}
 
 	return nil
@@ -595,14 +677,10 @@ loop:
 func (c *Client) handleIntersectNotFound(msgGeneric protocol.Message) error {
 	msgIntersectNotFound := msgGeneric.(*MsgIntersectNotFound)
 
-loop:
-	for len(c.wantIntersectResultChan) > 0 {
-		select {
-		case ch := <-c.wantIntersectResultChan:
-			ch <- clientIntersectResult{tip: msgIntersectNotFound.Tip, error: IntersectNotFoundError}
-		default:
-			break loop
-		}
+	select {
+	case ch := <-c.wantIntersectResultChan:
+		ch <- clientIntersectResult{tip: msgIntersectNotFound.Tip, error: IntersectNotFoundError}
+	default:
 	}
 
 	return nil
