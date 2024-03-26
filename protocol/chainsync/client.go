@@ -379,6 +379,11 @@ func (c *Client) syncLoop() {
 			// Sync was cancelled
 			return
 		}
+
+		// TODO: This seems to cause an error if GetCurrentTip is called while unlocked.
+		//
+		// error handling protocol state transition: message  not allowed in current protocol state CanAwait
+
 		c.busyMutex.Lock()
 		// Request the next block
 		// In practice we already have multiple block requests pipelined
