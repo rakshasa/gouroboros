@@ -33,7 +33,6 @@ type Client struct {
 
 	handleMessageChan       chan<- clientMessage
 	gracefulStopChan        chan chan<- error
-	immediateStopChan       chan chan<- error
 	wantFirstBlockChan      chan chan<- clientFirstBlock
 	wantIntersectResultChan chan chan<- clientIntersectResult
 	wantRollbackChan        chan chan<- clientRollback
@@ -78,7 +77,6 @@ func NewClient(protoOptions protocol.ProtocolOptions, cfg *Config) *Client {
 		config:                cfg,
 		readyForNextBlockChan: make(chan bool),
 		gracefulStopChan:      make(chan chan<- error, 10),
-		immediateStopChan:     make(chan chan<- error, 10),
 
 		// TODO: We should only have a buffer size of 1 here, and review the protocol to make sure
 		// it always responds to messages. If it doesn't, we should add a timeout to the channels
@@ -127,14 +125,6 @@ func NewClient(protoOptions protocol.ProtocolOptions, cfg *Config) *Client {
 func (c *Client) Stop() error {
 	errorChan := make(chan error, 1)
 	c.gracefulStopChan <- errorChan
-	return c.waitForError(errorChan)
-}
-
-// Close immediately transitions the protocol to the Done state. No more protocol operations will be
-// possible afterward
-func (c *Client) Close() error {
-	errorChan := make(chan error, 1)
-	c.immediateStopChan <- errorChan
 	return c.waitForError(errorChan)
 }
 
@@ -333,7 +323,6 @@ func (c *Client) wantRollback() (<-chan clientRollback, func()) {
 }
 
 func (c *Client) requestFindIntersect(intersectPoints []common.Point) clientIntersectResult {
-	// TODO: Retry on rollback.
 	resultChan, cancel := c.wantIntersectResult()
 
 	msg := NewMsgFindIntersect(intersectPoints)
@@ -398,23 +387,24 @@ func (c *Client) clientLoop(handleMessageChan <-chan clientMessage) {
 	messageHandlerDoneChan := make(chan struct{})
 	go c.messageHandlerLoop(handleMessageChan, messageHandlerDoneChan)
 
-	doneMessageSent := false
+	// TODO: Add request current tip here...
 
 	for {
 		select {
 		case <-c.Protocol.DoneChan():
 			return
-
 		case <-messageHandlerDoneChan:
 			// messageHandlerLoop is responsible for the protocol connection being closed.
 			return
-
 		case ch := <-c.immediateStopChan:
-			if !doneMessageSent {
-				// TODO: Add a timeout.
-				doneMessageSent = true
-				msg := NewMsgDone()
-				ch <- c.SendMessage(msg)
+			// TODO: Add a Close function to protocol.
+			// err := c.Close()
+
+			ch <- err
+
+			// Reconsider the error handling here if the current behavior is changed.
+			if err == nil || err == protocol.ProtocolShuttingDownError {
+				return
 			}
 		}
 	}
@@ -431,7 +421,6 @@ func (c *Client) messageHandlerLoop(handleMessageChan <-chan clientMessage, mess
 			select {
 			case msg := <-handleMessageChan:
 				msg.errorChan <- protocol.ProtocolShuttingDownError
-
 			case <-c.gracefulStopChan:
 			case <-c.wantIntersectResultChan:
 			case <-c.wantRollbackChan:
@@ -442,19 +431,30 @@ func (c *Client) messageHandlerLoop(handleMessageChan <-chan clientMessage, mess
 		}
 	}()
 
+	doneMessageSent := false
+
 	for {
 		select {
 		case <-c.Protocol.DoneChan():
 			return
-
 		case ch := <-c.gracefulStopChan:
-			err := c.Close()
-			ch <- err
+			if !doneMessageSent {
+				// Not entirely correct, but enough for now while have to deal with busyMutex.
+				c.busyMutex.Lock()
+				msg := NewMsgDone()
+				err := c.SendMessage(msg)
+				c.busyMutex.Unlock()
 
-			// Reconsider the error handling here if the current behavior is changed.
-			if err == nil || err == protocol.ProtocolShuttingDownError {
-				return
+				if err != nil && err != protocol.ProtocolShuttingDownError {
+					ch <- err
+					break
+				}
+				doneMessageSent = true
 			}
+			go func() {
+				<-c.Protocol.DoneChan()
+				ch <- nil
+			}()
 
 		case msg := <-handleMessageChan:
 			msg.errorChan <- func() error {
