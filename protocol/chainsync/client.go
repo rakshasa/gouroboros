@@ -31,8 +31,11 @@ type Client struct {
 	busyMutex             sync.Mutex
 	readyForNextBlockChan chan bool
 
-	handleMessageChan       chan<- clientMessage
-	gracefulStopChan        chan chan<- error
+	handleMessageChan chan<- clientMessage
+	gracefulStopChan  chan chan<- error
+	startSyncingChan  chan struct{}
+
+	requestNextBlockChan    chan struct{}
 	wantCurrentTipChan      chan chan<- clientCurrentTip
 	wantFirstBlockChan      chan chan<- clientFirstBlock
 	wantIntersectResultChan chan chan<- clientIntersectResult
@@ -82,6 +85,9 @@ func NewClient(protoOptions protocol.ProtocolOptions, cfg *Config) *Client {
 		config:                cfg,
 		readyForNextBlockChan: make(chan bool),
 		gracefulStopChan:      make(chan chan<- error, 10),
+		startSyncingChan:      make(chan struct{}),
+
+		requestNextBlockChan: make(chan struct{}),
 
 		// TODO: We should only have a buffer size of 1 here, and review the protocol to make sure
 		// it always responds to messages. If it doesn't, we should add a timeout to the channels
@@ -255,6 +261,10 @@ func (c *Client) GetAvailableBlockRange(
 func (c *Client) Sync(intersectPoints []common.Point) error {
 	c.busyMutex.Lock()
 	defer c.busyMutex.Unlock()
+
+	// TODO: Check if we're already syncing, if so return an error or cancel the current sync
+	// operation. Use a channel for this.
+
 	// Use origin if no intersect points were specified
 	if len(intersectPoints) == 0 {
 		intersectPoints = []common.Point{common.NewPointOrigin()}
@@ -297,7 +307,12 @@ func (c *Client) Sync(intersectPoints []common.Point) error {
 
 	fmt.Println("Sync: startin sync loop")
 
-	go c.syncLoop()
+	select {
+	case <-c.Protocol.DoneChan():
+		return protocol.ProtocolShuttingDownError
+	case c.startSyncingChan <- struct{}{}:
+	}
+
 	return nil
 }
 
@@ -369,34 +384,6 @@ func (c *Client) requestFindIntersect(intersectPoints []common.Point) clientInte
 	}
 }
 
-func (c *Client) syncLoop() {
-	for {
-		// Wait for a block to be received
-		if ready, ok := <-c.readyForNextBlockChan; !ok {
-			// Channel is closed, which means we're shutting down
-			return
-		} else if !ready {
-			// Sync was cancelled
-			return
-		}
-
-		// TODO: This seems to cause an error if GetCurrentTip is called while unlocked.
-		//
-		// error handling protocol state transition: message  not allowed in current protocol state CanAwait
-
-		c.busyMutex.Lock()
-		// Request the next block
-		// In practice we already have multiple block requests pipelined
-		// and this just adds another one to the pile
-		msg := NewMsgRequestNext()
-		if err := c.SendMessage(msg); err != nil {
-			c.SendError(err)
-			return
-		}
-		c.busyMutex.Unlock()
-	}
-}
-
 // clientLoop is the main loop for the client.
 //
 // TODO: Future changes should move all request handling to a request (or client) loop, and wait
@@ -410,8 +397,12 @@ func (c *Client) clientLoop(handleMessageChan <-chan clientMessage) {
 
 	messageHandlerDoneChan := make(chan struct{})
 	go c.messageHandlerLoop(handleMessageChan, messageHandlerDoneChan)
+	requestHandlerDoneChan := make(chan struct{})
+	go c.requestHandlerLoop(requestHandlerDoneChan)
 
-	// TODO: Add request current tip here...
+	isSyncing := false
+	syncPipelineCount := 0
+	syncRequestNextBlockChan := chan struct{}(nil)
 
 	for {
 		select {
@@ -420,6 +411,62 @@ func (c *Client) clientLoop(handleMessageChan <-chan clientMessage) {
 		case <-messageHandlerDoneChan:
 			// messageHandlerLoop is responsible for the underlying protocol connection being closed.
 			return
+		case <-requestHandlerDoneChan:
+			return
+
+		case <-c.startSyncingChan:
+			if isSyncing {
+				// Already syncing. This should be an error.
+				continue
+			}
+
+			isSyncing = true
+
+			// TODO: Fill pipeline with initial block requests here.
+			// TODO: Consider setting readyForNextBlockChan to nil to keep old behavior.
+
+		case ready := <-c.readyForNextBlockChan:
+			if !isSyncing {
+				// We're not syncing, so just ignore the ready signal. This might need better handling.
+				continue
+			}
+			if !ready {
+				isSyncing = false
+				syncPipelineCount = 0
+				syncRequestNextBlockChan = nil
+				continue
+			}
+
+			syncPipelineCount++
+			syncRequestNextBlockChan = c.requestNextBlockChan
+
+		case syncRequestNextBlockChan <- struct{}{}:
+			syncPipelineCount--
+
+			if syncPipelineCount == 0 {
+				syncRequestNextBlockChan = nil
+			}
+		}
+	}
+}
+
+func (c *Client) requestHandlerLoop(requestHandlerDoneChan chan<- struct{}) {
+	defer func() {
+		close(requestHandlerDoneChan)
+	}()
+
+	for {
+		select {
+		case <-c.Protocol.DoneChan():
+			return
+		case <-c.requestNextBlockChan:
+			c.busyMutex.Lock()
+			msg := NewMsgRequestNext()
+			if err := c.SendMessage(msg); err != nil {
+				c.SendError(err)
+				return
+			}
+			c.busyMutex.Unlock()
 		}
 	}
 }

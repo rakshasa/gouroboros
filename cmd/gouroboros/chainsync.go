@@ -208,6 +208,23 @@ func testChainSync(f *globalFlags) {
 		os.Exit(1)
 	}
 
+	// REMOVE: Test GetCurrentTip during chain sync.
+	// go func() {
+	// 	for {
+	// 		time.Sleep(10 * time.Millisecond)
+
+	// 		go func() {
+	// 			tip, err := oConn.ChainSync().Client.GetCurrentTip()
+	// 			if err != nil {
+	// 				fmt.Printf("ERROR: GetCurrentTip: %v\n", err)
+	// 				return
+	// 			}
+
+	// 			fmt.Printf("Current tip: %d\n", tip.BlockNumber)
+	// 		}()
+	// 	}
+	// }()
+
 	var point common.Point
 	if chainSyncFlags.tip {
 		tip, err := oConn.ChainSync().Client.GetCurrentTip()
