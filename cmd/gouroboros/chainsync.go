@@ -19,6 +19,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	ouroboros "github.com/blinklabs-io/gouroboros"
 	"github.com/blinklabs-io/gouroboros/ledger"
@@ -209,21 +210,30 @@ func testChainSync(f *globalFlags) {
 	}
 
 	// REMOVE: Test GetCurrentTip during chain sync.
-	// go func() {
-	// 	for {
-	// 		time.Sleep(10 * time.Millisecond)
+	for i := 0; i < 10; i++ {
+		go func() {
+			last := uint64(0)
+			count := 0
 
-	// 		go func() {
-	// 			tip, err := oConn.ChainSync().Client.GetCurrentTip()
-	// 			if err != nil {
-	// 				fmt.Printf("ERROR: GetCurrentTip: %v\n", err)
-	// 				return
-	// 			}
+			for {
+				count++
 
-	// 			fmt.Printf("Current tip: %d\n", tip.BlockNumber)
-	// 		}()
-	// 	}
-	// }()
+				tip, err := oConn.ChainSync().Client.GetCurrentTip()
+				if err != nil {
+					fmt.Printf("ERROR: GetCurrentTip: %v\n", err)
+					return
+				}
+
+				if tip.BlockNumber != last {
+					fmt.Printf("tip: block:%d count:%d\n", tip.BlockNumber, count)
+					last = tip.BlockNumber
+					count = 0
+				}
+
+				time.Sleep(10 * time.Millisecond)
+			}
+		}()
+	}
 
 	var point common.Point
 	if chainSyncFlags.tip {

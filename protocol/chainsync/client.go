@@ -18,6 +18,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/blinklabs-io/gouroboros/ledger"
 	"github.com/blinklabs-io/gouroboros/protocol"
@@ -33,8 +34,9 @@ type Client struct {
 
 	handleMessageChan chan<- clientMessage
 	gracefulStopChan  chan chan<- error
-	startSyncingChan  chan struct{}
+	startSyncingChan  chan chan<- struct{}
 
+	requestIntersectChan    chan clientIntersectRequest
 	requestNextBlockChan    chan struct{}
 	wantCurrentTipChan      chan chan<- clientCurrentTip
 	wantFirstBlockChan      chan chan<- clientFirstBlock
@@ -54,6 +56,11 @@ type clientCurrentTip struct {
 type clientFirstBlock struct {
 	point common.Point
 	error error
+}
+
+type clientIntersectRequest struct {
+	intersectPoints []common.Point
+	resultChan      chan<- clientIntersectResult
 }
 
 type clientIntersectResult struct {
@@ -85,8 +92,9 @@ func NewClient(protoOptions protocol.ProtocolOptions, cfg *Config) *Client {
 		config:                cfg,
 		readyForNextBlockChan: make(chan bool),
 		gracefulStopChan:      make(chan chan<- error, 10),
-		startSyncingChan:      make(chan struct{}),
+		startSyncingChan:      make(chan chan<- struct{}),
 
+		requestIntersectChan: make(chan clientIntersectRequest),
 		requestNextBlockChan: make(chan struct{}),
 
 		// TODO: We should only have a buffer size of 1 here, and review the protocol to make sure
@@ -143,23 +151,12 @@ func (c *Client) Stop() error {
 // GetCurrentTip returns the current chain tip
 func (c *Client) GetCurrentTip() (*Tip, error) {
 	currentTipChan := make(chan clientCurrentTip, 1)
-	intersectResultChan := make(chan clientIntersectResult, 1)
+	resultChan := make(chan clientIntersectResult, 1)
 
-	done := make(chan struct{})
-	defer close(done)
-
-	go func() {
-		// TODO: Replace with channels so we don't have unnecessary locking/unlocking here.
-		c.busyMutex.Lock()
-		defer c.busyMutex.Unlock()
-
-		select {
-		case <-done:
-			return
-		default:
-			intersectResultChan <- c.requestFindIntersect([]common.Point{})
-		}
-	}()
+	request := clientIntersectRequest{
+		intersectPoints: []common.Point{},
+		resultChan:      resultChan,
+	}
 
 	select {
 	case <-c.Protocol.DoneChan():
@@ -167,7 +164,13 @@ func (c *Client) GetCurrentTip() (*Tip, error) {
 	case c.wantCurrentTipChan <- currentTipChan:
 		result := <-currentTipChan
 		return &result.tip, nil
-	case result := <-intersectResultChan:
+	case c.requestIntersectChan <- request:
+	}
+
+	select {
+	case <-c.Protocol.DoneChan():
+		return nil, protocol.ProtocolShuttingDownError
+	case result := <-resultChan:
 		if result.error != nil && result.error != IntersectNotFoundError {
 			return nil, result.error
 		}
@@ -307,11 +310,9 @@ func (c *Client) Sync(intersectPoints []common.Point) error {
 
 	fmt.Println("Sync: startin sync loop")
 
-	select {
-	case <-c.Protocol.DoneChan():
-		return protocol.ProtocolShuttingDownError
-	case c.startSyncingChan <- struct{}{}:
-	}
+	startedSyncingChan := make(chan struct{}, 1)
+	c.startSyncingChan <- startedSyncingChan
+	<-startedSyncingChan
 
 	return nil
 }
@@ -379,7 +380,7 @@ func (c *Client) requestFindIntersect(intersectPoints []common.Point) clientInte
 	case <-c.Protocol.DoneChan():
 		return clientIntersectResult{error: protocol.ProtocolShuttingDownError}
 	case result := <-resultChan:
-		fmt.Printf("requestFindIntersect: received intersect: %+v - %+v - %v\n", result.tip, result.point, result.error)
+		fmt.Printf("requestFindIntersect: received intersect: %+v --- %+v --- %+v --- %v\n", intersectPoints, result.tip, result.point, result.error)
 		return result
 	}
 }
@@ -393,12 +394,23 @@ func (c *Client) clientLoop(handleMessageChan <-chan clientMessage) {
 	defer func() {
 		// TODO: We should avoid closing channels, instead they should check done channel.
 		close(c.readyForNextBlockChan)
+
+		for {
+			// TODO: Review what channels should be emptied.
+			select {
+			case startSyncingChan := <-c.startSyncingChan:
+				// TODO: Return error.
+				startSyncingChan <- struct{}{}
+			}
+		}
 	}()
+
+	syncStateChan := make(chan bool)
 
 	messageHandlerDoneChan := make(chan struct{})
 	go c.messageHandlerLoop(handleMessageChan, messageHandlerDoneChan)
 	requestHandlerDoneChan := make(chan struct{})
-	go c.requestHandlerLoop(requestHandlerDoneChan)
+	go c.requestHandlerLoop(requestHandlerDoneChan, syncStateChan)
 
 	isSyncing := false
 	syncPipelineCount := 0
@@ -414,13 +426,16 @@ func (c *Client) clientLoop(handleMessageChan <-chan clientMessage) {
 		case <-requestHandlerDoneChan:
 			return
 
-		case <-c.startSyncingChan:
+		case startedSyncingChan := <-c.startSyncingChan:
 			if isSyncing {
 				// Already syncing. This should be an error.
-				continue
+				startedSyncingChan <- struct{}{}
+				return
 			}
 
 			isSyncing = true
+			syncStateChan <- true
+			startedSyncingChan <- struct{}{}
 
 			// TODO: Fill pipeline with initial block requests here.
 			// TODO: Consider setting readyForNextBlockChan to nil to keep old behavior.
@@ -434,6 +449,13 @@ func (c *Client) clientLoop(handleMessageChan <-chan clientMessage) {
 				isSyncing = false
 				syncPipelineCount = 0
 				syncRequestNextBlockChan = nil
+
+				select {
+				case syncStateChan <- false:
+				case <-c.Protocol.DoneChan():
+					return
+				}
+
 				continue
 			}
 
@@ -450,15 +472,50 @@ func (c *Client) clientLoop(handleMessageChan <-chan clientMessage) {
 	}
 }
 
-func (c *Client) requestHandlerLoop(requestHandlerDoneChan chan<- struct{}) {
+func (c *Client) requestHandlerLoop(requestHandlerDoneChan chan<- struct{}, syncStateChan <-chan bool) {
 	defer func() {
 		close(requestHandlerDoneChan)
+
+		for {
+			// TODO: Review what channels should be emptied.
+			select {
+			case <-syncStateChan:
+			case <-c.requestNextBlockChan:
+			}
+		}
 	}()
+
+	requestIntersectChan := c.requestIntersectChan
 
 	for {
 		select {
 		case <-c.Protocol.DoneChan():
 			return
+
+		case state := <-syncStateChan:
+			if state {
+				requestIntersectChan = nil
+			} else {
+				requestIntersectChan = c.requestIntersectChan
+			}
+
+		case request := <-requestIntersectChan:
+			// TODO: Once we have all request being called from here, we can avoid the lock.
+			if !c.busyMutex.TryLock() {
+				// TODO: Required since we've not converted all request to be called from here, so
+				// sync state isn't always set.
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+
+			select {
+			case request.resultChan <- c.requestFindIntersect(request.intersectPoints):
+				c.busyMutex.Unlock()
+			case <-c.Protocol.DoneChan():
+				c.busyMutex.Unlock()
+				return
+			}
+
 		case <-c.requestNextBlockChan:
 			c.busyMutex.Lock()
 			msg := NewMsgRequestNext()
