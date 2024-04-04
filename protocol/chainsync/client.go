@@ -480,6 +480,8 @@ func (c *Client) clientLoop(handleMessageChan <-chan clientMessage) {
 
 	isSyncing := false
 	syncPipelineCount := 0
+	// TODO: Clean these up, we should have a unified (or per-requester) handling of readyForNextBlockChan.
+	syncReadyForNextBlockChan := chan bool(nil)
 	syncRequestNextBlockChan := chan struct{}(nil)
 
 	for {
@@ -500,13 +502,15 @@ func (c *Client) clientLoop(handleMessageChan <-chan clientMessage) {
 			}
 
 			isSyncing = true
+			syncReadyForNextBlockChan = c.readyForNextBlockChan
+
 			syncStateChan <- true
 			startedSyncingChan <- struct{}{}
 
 			// TODO: Fill pipeline with initial block requests here.
 			// TODO: Consider setting readyForNextBlockChan to nil to keep old behavior.
 
-		case ready := <-c.readyForNextBlockChan:
+		case ready := <-syncReadyForNextBlockChan:
 			if !isSyncing {
 				// We're not syncing, so just ignore the ready signal. This might need better handling.
 				continue
@@ -515,6 +519,7 @@ func (c *Client) clientLoop(handleMessageChan <-chan clientMessage) {
 				isSyncing = false
 				syncPipelineCount = 0
 				syncRequestNextBlockChan = nil
+				syncReadyForNextBlockChan = nil
 
 				select {
 				case syncStateChan <- false:
@@ -815,16 +820,16 @@ func (c *Client) handleRollBackward(msg protocol.Message) error {
 	default:
 	}
 
-	firstBlockChan := func() chan<- clientFirstBlock {
-		select {
-		case ch := <-c.wantFirstBlockChan:
-			return ch
-		default:
-			return nil
-		}
-	}()
+	// firstBlockChan := func() chan<- clientFirstBlock {
+	// 	select {
+	// 	case ch := <-c.wantFirstBlockChan:
+	// 		return ch
+	// 	default:
+	// 		return nil
+	// 	}
+	// }()
 
-	if firstBlockChan == nil {
+	if len(c.wantFirstBlockChan) == 0 {
 		if c.config.RollBackwardFunc == nil {
 			return fmt.Errorf(
 				"received chain-sync RollBackward message but no callback function is defined",
@@ -841,9 +846,11 @@ func (c *Client) handleRollBackward(msg protocol.Message) error {
 			}
 		}
 	} else {
-		firstBlockChan <- clientFirstBlock{point: msgRollBackward.Point}
+		// firstBlockChan <- clientFirstBlock{point: msgRollBackward.Point}
+		fmt.Printf("handleRolling firstBlockchan\n")
 	}
 
+	// TODO: If the requester cancels, and this doesn't get flushed it causes an issue.
 	c.readyForNextBlockChan <- true
 	return nil
 }
