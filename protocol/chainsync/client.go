@@ -18,7 +18,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sync"
-	"time"
 
 	"github.com/blinklabs-io/gouroboros/ledger"
 	"github.com/blinklabs-io/gouroboros/protocol"
@@ -36,12 +35,12 @@ type Client struct {
 	gracefulStopChan  chan chan<- error
 	startSyncingChan  chan chan<- struct{}
 
-	requestIntersectChan    chan clientIntersectRequest
-	requestNextBlockChan    chan struct{}
-	wantCurrentTipChan      chan chan<- clientCurrentTip
-	wantFirstBlockChan      chan chan<- clientFirstBlock
-	wantIntersectResultChan chan chan<- clientIntersectResult
-	wantRollbackChan        chan chan<- clientRollback
+	requestFindIntersectChan chan clientFindIntersectRequest
+	requestNextBlockChan     chan struct{}
+	wantCurrentTipChan       chan chan<- clientCurrentTip
+	wantFirstBlockChan       chan chan<- clientFirstBlock
+	wantIntersectResultChan  chan chan<- clientIntersectResult
+	wantRollbackChan         chan chan<- clientRollback
 }
 
 type clientMessage struct {
@@ -58,7 +57,7 @@ type clientFirstBlock struct {
 	error error
 }
 
-type clientIntersectRequest struct {
+type clientFindIntersectRequest struct {
 	intersectPoints []common.Point
 	resultChan      chan<- clientIntersectResult
 }
@@ -94,8 +93,8 @@ func NewClient(protoOptions protocol.ProtocolOptions, cfg *Config) *Client {
 		gracefulStopChan:      make(chan chan<- error, 10),
 		startSyncingChan:      make(chan chan<- struct{}),
 
-		requestIntersectChan: make(chan clientIntersectRequest),
-		requestNextBlockChan: make(chan struct{}),
+		requestFindIntersectChan: make(chan clientFindIntersectRequest),
+		requestNextBlockChan:     make(chan struct{}),
 
 		// TODO: We should only have a buffer size of 1 here, and review the protocol to make sure
 		// it always responds to messages. If it doesn't, we should add a timeout to the channels
@@ -153,7 +152,7 @@ func (c *Client) GetCurrentTip() (*Tip, error) {
 	currentTipChan := make(chan clientCurrentTip, 1)
 	resultChan := make(chan clientIntersectResult, 1)
 
-	request := clientIntersectRequest{
+	request := clientFindIntersectRequest{
 		intersectPoints: []common.Point{},
 		resultChan:      resultChan,
 	}
@@ -164,7 +163,7 @@ func (c *Client) GetCurrentTip() (*Tip, error) {
 	case c.wantCurrentTipChan <- currentTipChan:
 		result := <-currentTipChan
 		return &result.tip, nil
-	case c.requestIntersectChan <- request:
+	case c.requestFindIntersectChan <- request:
 	}
 
 	select {
@@ -485,7 +484,8 @@ func (c *Client) requestHandlerLoop(requestHandlerDoneChan chan<- struct{}, sync
 		}
 	}()
 
-	requestIntersectChan := c.requestIntersectChan
+	// TODO: Reduce the number of channels by casting the type.
+	requestFindIntersectChan := c.requestFindIntersectChan
 
 	for {
 		select {
@@ -494,19 +494,21 @@ func (c *Client) requestHandlerLoop(requestHandlerDoneChan chan<- struct{}, sync
 
 		case state := <-syncStateChan:
 			if state {
-				requestIntersectChan = nil
+				requestFindIntersectChan = nil
 			} else {
-				requestIntersectChan = c.requestIntersectChan
+				requestFindIntersectChan = c.requestFindIntersectChan
 			}
 
-		case request := <-requestIntersectChan:
-			// TODO: Once we have all request being called from here, we can avoid the lock.
-			if !c.busyMutex.TryLock() {
-				// TODO: Required since we've not converted all request to be called from here, so
-				// sync state isn't always set.
-				time.Sleep(10 * time.Millisecond)
-				continue
-			}
+		case request := <-requestFindIntersectChan:
+			// // TODO: Once we have all request being called from here, we can avoid the lock.
+			// if !c.busyMutex.TryLock() {
+			// 	// TODO: Required since we've not converted all request to be called from here, so
+			// 	// sync state isn't always set.
+			// 	time.Sleep(10 * time.Millisecond)
+			// 	continue
+			// }
+
+			c.busyMutex.Lock()
 
 			select {
 			case request.resultChan <- c.requestFindIntersect(request.intersectPoints):
