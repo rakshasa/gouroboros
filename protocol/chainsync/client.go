@@ -17,7 +17,6 @@ package chainsync
 import (
 	"encoding/hex"
 	"fmt"
-	"sync"
 
 	"github.com/blinklabs-io/gouroboros/ledger"
 	"github.com/blinklabs-io/gouroboros/protocol"
@@ -28,16 +27,17 @@ import (
 type Client struct {
 	*protocol.Protocol
 	config                *Config
-	busyMutex             sync.Mutex
 	readyForNextBlockChan chan bool
 
 	handleMessageChan chan<- clientMessage
 	gracefulStopChan  chan chan<- error
-	startSyncingChan  chan chan<- struct{}
+	startSyncingChan  chan clientSyncingRequest
 
 	requestFindIntersectChan          chan clientFindIntersectRequest
 	requestGetAvailableBlockRangeChan chan clientGetAvailableBlockRangeRequest
 	requestNextBlockChan              chan struct{}
+	requestStartSyncingChan           chan clientSyncingRequest
+	requestStopSyncingChan            chan struct{}
 	wantCurrentTipChan                chan chan<- clientCurrentTip
 	wantFirstBlockChan                chan chan<- clientFirstBlock
 	wantIntersectFoundChan            chan chan<- clientIntersectFound
@@ -47,6 +47,11 @@ type Client struct {
 type clientMessage struct {
 	message   protocol.Message
 	errorChan chan<- error
+}
+
+type clientSyncingRequest struct {
+	intersectPoints []common.Point
+	resultChan      chan<- error
 }
 
 type clientFindIntersectRequest struct {
@@ -94,6 +99,7 @@ func NewClient(protoOptions protocol.ProtocolOptions, cfg *Config) *Client {
 		ProtocolId = ProtocolIdNtN
 		msgFromCborFunc = NewMsgFromCborNtN
 	}
+	// TODO: Storing the config as a pointer is unsafe.
 	if cfg == nil {
 		tmpCfg := NewConfig()
 		cfg = &tmpCfg
@@ -103,11 +109,13 @@ func NewClient(protoOptions protocol.ProtocolOptions, cfg *Config) *Client {
 		config:                cfg,
 		readyForNextBlockChan: make(chan bool),
 		gracefulStopChan:      make(chan chan<- error, 10),
-		startSyncingChan:      make(chan chan<- struct{}),
+		startSyncingChan:      make(chan clientSyncingRequest),
 
 		requestFindIntersectChan:          make(chan clientFindIntersectRequest),
 		requestGetAvailableBlockRangeChan: make(chan clientGetAvailableBlockRangeRequest),
 		requestNextBlockChan:              make(chan struct{}),
+		requestStartSyncingChan:           make(chan clientSyncingRequest),
+		requestStopSyncingChan:            make(chan struct{}),
 
 		// TODO: We should only have a buffer size of 1 here, and review the protocol to make sure
 		// it always responds to messages. If it doesn't, we should add a timeout to the channels
@@ -222,80 +230,19 @@ func (c *Client) GetAvailableBlockRange(
 // Sync begins a chain-sync operation using the provided intersect point(s). Incoming blocks will be delivered
 // via the RollForward callback function specified in the protocol config
 func (c *Client) Sync(intersectPoints []common.Point) error {
-	c.busyMutex.Lock()
-	defer c.busyMutex.Unlock()
-
-	// TODO: Check if we're already syncing, if so return an error or cancel the current sync
-	// operation. Use a channel for this.
-
-	// Use origin if no intersect points were specified
-	if len(intersectPoints) == 0 {
-		intersectPoints = []common.Point{common.NewPointOrigin()}
-	}
-
-	fmt.Printf("Sync: intersectPoints=%v\n", func() string {
-		var s string
-		for _, p := range intersectPoints {
-			s += fmt.Sprintf("%v ", p.Slot)
-		}
-		return s
-	}())
-
-	intersectResultChan, cancel := c.wantIntersectFound()
-	msg := NewMsgFindIntersect(intersectPoints)
-	if err := c.SendMessage(msg); err != nil {
-		cancel()
-		return err
+	resultChan := make(chan error, 1)
+	request := clientSyncingRequest{
+		intersectPoints: intersectPoints,
+		resultChan:      resultChan,
 	}
 
 	select {
 	case <-c.Protocol.DoneChan():
 		return protocol.ProtocolShuttingDownError
-	case result := <-intersectResultChan:
-		if result.error != nil {
-			return result.error
-		}
+	case c.startSyncingChan <- request:
 	}
 
-	fmt.Println("Sync: fill pipeline")
-
-	// Pipeline the initial block requests to speed things up a bit
-	// Using a value higher than 10 seems to cause problems with NtN
-	for i := 0; i <= c.config.PipelineLimit; i++ {
-		msg := NewMsgRequestNext()
-		if err := c.SendMessage(msg); err != nil {
-			return err
-		}
-	}
-
-	fmt.Println("Sync: startin sync loop")
-
-	startedSyncingChan := make(chan struct{}, 1)
-	c.startSyncingChan <- startedSyncingChan
-	<-startedSyncingChan
-
-	return nil
-}
-
-func (c *Client) waitForError(ch <-chan error) error {
-	select {
-	case <-c.Protocol.DoneChan():
-		return protocol.ProtocolShuttingDownError
-	case err := <-ch:
-		return err
-	}
-}
-
-func (c *Client) sendCurrentTip(tip Tip) {
-	for {
-		select {
-		case ch := <-c.wantCurrentTipChan:
-			fmt.Printf("sendCurrentTip: %v\n", tip)
-			ch <- clientCurrentTip{tip: tip}
-		default:
-			return
-		}
-	}
+	return c.waitForError(resultChan)
 }
 
 func (c *Client) requestFindIntersect(intersectPoints []common.Point) clientIntersectFound {
@@ -411,6 +358,76 @@ func (c *Client) requestGetAvailableBlockRange(
 	return clientGetAvailableBlockRangeResult{start: start, end: end}
 }
 
+func (c *Client) requestSync(intersectPoints []common.Point) error {
+	// TODO: Check if we're already syncing, if so return an error or cancel the current sync
+	// operation. Use a channel for this.
+
+	// Use origin if no intersect points were specified
+	if len(intersectPoints) == 0 {
+		intersectPoints = []common.Point{common.NewPointOrigin()}
+	}
+
+	fmt.Printf("Sync: intersectPoints=%v\n", func() string {
+		var s string
+		for _, p := range intersectPoints {
+			s += fmt.Sprintf("%v ", p.Slot)
+		}
+		return s
+	}())
+
+	intersectResultChan, cancel := c.wantIntersectFound()
+	msg := NewMsgFindIntersect(intersectPoints)
+	if err := c.SendMessage(msg); err != nil {
+		cancel()
+		return err
+	}
+
+	select {
+	case <-c.Protocol.DoneChan():
+		return protocol.ProtocolShuttingDownError
+	case result := <-intersectResultChan:
+		if result.error != nil {
+			return result.error
+		}
+	}
+
+	// fmt.Println("Sync: fill pipeline")
+
+	// Pipeline the initial block requests to speed things up a bit
+	// Using a value higher than 10 seems to cause problems with NtN
+	// for i := 0; i <= c.config.PipelineLimit; i++ {
+	// 	msg := NewMsgRequestNext()
+	// 	if err := c.SendMessage(msg); err != nil {
+	// 		return err
+	// 	}
+	// }
+
+	fmt.Println("Sync: startin sync loop")
+
+	return nil
+}
+
+func (c *Client) sendCurrentTip(tip Tip) {
+	for {
+		select {
+		case ch := <-c.wantCurrentTipChan:
+			fmt.Printf("sendCurrentTip: %v\n", tip)
+			ch <- clientCurrentTip{tip: tip}
+		default:
+			return
+		}
+	}
+}
+
+func (c *Client) waitForError(ch <-chan error) error {
+	select {
+	case <-c.Protocol.DoneChan():
+		return protocol.ProtocolShuttingDownError
+	case err := <-ch:
+		return err
+	}
+}
+
 // want* returns a channel that will receive the result of the next intersect request,
 // and a function that can be used to clear the channel if sending the request message fails.
 //
@@ -464,25 +481,29 @@ func (c *Client) clientLoop(handleMessageChan <-chan clientMessage) {
 		for {
 			// TODO: Review what channels should be emptied.
 			select {
-			case startSyncingChan := <-c.startSyncingChan:
+			case ch := <-c.startSyncingChan:
 				// TODO: Return error.
-				startSyncingChan <- struct{}{}
+				ch.resultChan <- nil
 			}
 		}
 	}()
 
-	syncStateChan := make(chan bool)
-
 	messageHandlerDoneChan := make(chan struct{})
 	go c.messageHandlerLoop(handleMessageChan, messageHandlerDoneChan)
 	requestHandlerDoneChan := make(chan struct{})
-	go c.requestHandlerLoop(requestHandlerDoneChan, syncStateChan)
+	go c.requestHandlerLoop(requestHandlerDoneChan)
 
 	isSyncing := false
 	syncPipelineCount := 0
+	syncPipelineLimit := c.config.PipelineLimit
 	// TODO: Clean these up, we should have a unified (or per-requester) handling of readyForNextBlockChan.
 	syncReadyForNextBlockChan := chan bool(nil)
 	syncRequestNextBlockChan := chan struct{}(nil)
+
+	if syncPipelineLimit < 1 {
+		// syncPipelineLimit = 1
+		syncPipelineLimit = 10
+	}
 
 	for {
 		select {
@@ -494,18 +515,34 @@ func (c *Client) clientLoop(handleMessageChan <-chan clientMessage) {
 		case <-requestHandlerDoneChan:
 			return
 
-		case startedSyncingChan := <-c.startSyncingChan:
+		case request := <-c.startSyncingChan:
 			if isSyncing {
 				// Already syncing. This should be an error.
-				startedSyncingChan <- struct{}{}
+				request.resultChan <- nil
+				return
+			}
+
+			resultChan := make(chan error, 1)
+			newRequest := clientSyncingRequest{intersectPoints: request.intersectPoints, resultChan: resultChan}
+
+			select {
+			case <-c.Protocol.DoneChan():
+				request.resultChan <- protocol.ProtocolShuttingDownError
+				return
+			case c.requestStartSyncingChan <- newRequest:
+			}
+
+			if err := c.waitForError(resultChan); err != nil {
+				request.resultChan <- err
 				return
 			}
 
 			isSyncing = true
+			syncPipelineCount = 0
 			syncReadyForNextBlockChan = c.readyForNextBlockChan
+			syncRequestNextBlockChan = c.requestNextBlockChan
 
-			syncStateChan <- true
-			startedSyncingChan <- struct{}{}
+			request.resultChan <- nil
 
 			// TODO: Fill pipeline with initial block requests here.
 			// TODO: Consider setting readyForNextBlockChan to nil to keep old behavior.
@@ -522,35 +559,40 @@ func (c *Client) clientLoop(handleMessageChan <-chan clientMessage) {
 				syncReadyForNextBlockChan = nil
 
 				select {
-				case syncStateChan <- false:
 				case <-c.Protocol.DoneChan():
 					return
+				case c.requestStopSyncingChan <- struct{}{}:
 				}
 
 				continue
 			}
 
-			syncPipelineCount++
-			syncRequestNextBlockChan = c.requestNextBlockChan
+			if syncPipelineCount != 0 {
+				syncPipelineCount--
+			}
+			if syncPipelineCount < syncPipelineLimit {
+				syncRequestNextBlockChan = c.requestNextBlockChan
+			}
 
 		case syncRequestNextBlockChan <- struct{}{}:
-			syncPipelineCount--
+			fmt.Printf("syncRequestNextBlockChan: %v : %v\n", syncPipelineCount, c.config.PipelineLimit)
 
-			if syncPipelineCount == 0 {
+			syncPipelineCount++
+
+			if syncPipelineCount >= syncPipelineLimit {
 				syncRequestNextBlockChan = nil
 			}
 		}
 	}
 }
 
-func (c *Client) requestHandlerLoop(requestHandlerDoneChan chan<- struct{}, syncStateChan <-chan bool) {
+func (c *Client) requestHandlerLoop(requestHandlerDoneChan chan<- struct{}) {
 	defer func() {
 		close(requestHandlerDoneChan)
 
 		for {
 			// TODO: Review what channels should be emptied.
 			select {
-			case <-syncStateChan:
 			case <-c.requestNextBlockChan:
 			}
 		}
@@ -565,54 +607,44 @@ func (c *Client) requestHandlerLoop(requestHandlerDoneChan chan<- struct{}, sync
 		case <-c.Protocol.DoneChan():
 			return
 
-		case state := <-syncStateChan:
-			if state {
-				requestFindIntersectChan = nil
-				requestGetAvailableBlockRangeChan = nil
-			} else {
-				requestFindIntersectChan = c.requestFindIntersectChan
-				requestGetAvailableBlockRangeChan = c.requestGetAvailableBlockRangeChan
+		case request := <-c.requestStartSyncingChan:
+			err := c.requestSync(request.intersectPoints)
+			request.resultChan <- err
+
+			// TODO: Better error handling for requests? Some might not be fatal.
+			if err != nil {
+				return
 			}
 
+			requestFindIntersectChan = nil
+			requestGetAvailableBlockRangeChan = nil
+
+		case <-c.requestStopSyncingChan:
+			requestFindIntersectChan = c.requestFindIntersectChan
+			requestGetAvailableBlockRangeChan = c.requestGetAvailableBlockRangeChan
+
 		case request := <-requestFindIntersectChan:
-			// TODO: Once we have all request being called from here, we can avoid the lock.
-			// if !c.busyMutex.TryLock() {
-			// 	// TODO: Required since we've not converted all request to be called from here, so
-			// 	// sync state isn't always set.
-			// 	time.Sleep(10 * time.Millisecond)
-			// 	continue
-			// }
-
-			c.busyMutex.Lock()
-
-			select {
-			case request.resultChan <- c.requestFindIntersect(request.intersectPoints):
-				c.busyMutex.Unlock()
-			case <-c.Protocol.DoneChan():
-				c.busyMutex.Unlock()
+			result := c.requestFindIntersect(request.intersectPoints)
+			request.resultChan <- result
+			if result.error != nil {
 				return
 			}
 
 		case request := <-requestGetAvailableBlockRangeChan:
-			c.busyMutex.Lock()
-
-			select {
-			case request.resultChan <- c.requestGetAvailableBlockRange(request.intersectPoints):
-				fmt.Println("requestGetAvailableBlockRange result sent")
-				c.busyMutex.Unlock()
-			case <-c.Protocol.DoneChan():
-				c.busyMutex.Unlock()
+			result := c.requestGetAvailableBlockRange(request.intersectPoints)
+			request.resultChan <- result
+			if result.error != nil {
 				return
 			}
 
 		case <-c.requestNextBlockChan:
-			c.busyMutex.Lock()
+			fmt.Printf("requestNextBlockChan\n")
+
 			msg := NewMsgRequestNext()
 			if err := c.SendMessage(msg); err != nil {
 				c.SendError(err)
 				return
 			}
-			c.busyMutex.Unlock()
 		}
 	}
 }
@@ -647,10 +679,12 @@ func (c *Client) messageHandlerLoop(handleMessageChan <-chan clientMessage, mess
 		case ch := <-c.gracefulStopChan:
 			if !doneMessageSent {
 				// Not entirely correct, but good enough for now while we have to deal with busyMutex.
-				c.busyMutex.Lock()
+
+				// TODO: MOVE TO REQUEST HANDLER LOOP?
+				// c.busyMutex.Lock()
 				msg := NewMsgDone()
 				err := c.SendMessage(msg)
-				c.busyMutex.Unlock()
+				// c.busyMutex.Unlock()
 
 				if err != nil && err != protocol.ProtocolShuttingDownError {
 					ch <- err
