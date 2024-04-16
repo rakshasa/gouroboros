@@ -60,6 +60,10 @@ var StateMap = protocol.StateMap{
 		Agency: protocol.AgencyServer,
 		Transitions: []protocol.StateTransition{
 			{
+				MsgType:  MessageTypeRequestNext,
+				NewState: stateCanAwait,
+			},
+			{
 				MsgType:  MessageTypeAwaitReply,
 				NewState: stateMustReply,
 			},

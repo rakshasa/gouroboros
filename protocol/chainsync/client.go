@@ -500,9 +500,12 @@ func (c *Client) clientLoop(handleMessageChan <-chan clientMessage) {
 	syncReadyForNextBlockChan := chan bool(nil)
 	syncRequestNextBlockChan := chan struct{}(nil)
 
+	// TESTING
+	syncPipelineLimit = 10
+
+	// TODO: Change NewClient to return errors on invalid configuration.
 	if syncPipelineLimit < 1 {
-		// syncPipelineLimit = 1
-		syncPipelineLimit = 10
+		syncPipelineLimit = 1
 	}
 
 	for {
