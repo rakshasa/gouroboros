@@ -71,14 +71,13 @@ func (b *ShelleyBlock) Era() Era {
 }
 
 func (b *ShelleyBlock) Transactions() []Transaction {
-	ret := []Transaction{}
+	ret := make([]Transaction, len(b.TransactionBodies))
 	for idx := range b.TransactionBodies {
-		tmpTransaction := ShelleyTransaction{
+		ret[idx] = &ShelleyTransaction{
 			Body:       b.TransactionBodies[idx],
 			WitnessSet: b.TransactionWitnessSets[idx],
 			TxMetadata: b.TransactionMetadataSet[uint(idx)],
 		}
-		ret = append(ret, &tmpTransaction)
 	}
 	return ret
 }
@@ -176,7 +175,7 @@ type ShelleyTransactionBody struct {
 	Withdrawals cbor.Value `cbor:"5,keyasint,omitempty"`
 	Update      struct {
 		cbor.StructAsArray
-		ProtocolParamUpdates cbor.Value
+		ProtocolParamUpdates map[Blake2b224]ShelleyProtocolParameterUpdate
 		Epoch                uint64
 	} `cbor:"6,keyasint,omitempty"`
 	MetadataHash Blake2b256 `cbor:"7,keyasint,omitempty"`
@@ -218,6 +217,10 @@ func (b *ShelleyTransactionBody) TTL() uint64 {
 	return b.Ttl
 }
 
+func (b *ShelleyTransactionBody) ReferenceInputs() []TransactionInput {
+	return []TransactionInput{}
+}
+
 func (b *ShelleyTransactionBody) Utxorpc() *utxorpc.Tx {
 	var txi []*utxorpc.TxInput
 	var txo []*utxorpc.TxOutput
@@ -236,14 +239,14 @@ func (b *ShelleyTransactionBody) Utxorpc() *utxorpc.Tx {
 	tx := &utxorpc.Tx{
 		Inputs:  txi,
 		Outputs: txo,
-		Fee:     b.Fee(),
-		Hash:    tmpHash,
 		// Certificates: b.Certificates(),
-		// Validity:     b.Validity(),
 		// Withdrawals:  b.Withdrawals(),
 		// Witnesses:    b.Witnesses(),
+		Fee: b.Fee(),
+		// Validity:     b.Validity(),
 		// Successful:   b.Successful(),
 		// Auxiliary:    b.AuxData(),
+		Hash: tmpHash,
 	}
 	return tx
 }
@@ -352,8 +355,16 @@ func (t ShelleyTransaction) TTL() uint64 {
 	return t.Body.TTL()
 }
 
+func (t ShelleyTransaction) ReferenceInputs() []TransactionInput {
+	return t.Body.ReferenceInputs()
+}
+
 func (t ShelleyTransaction) Metadata() *cbor.Value {
 	return t.TxMetadata
+}
+
+func (t ShelleyTransaction) IsValid() bool {
+	return true
 }
 
 func (t ShelleyTransaction) Utxorpc() *utxorpc.Tx {
@@ -384,6 +395,83 @@ func (t *ShelleyTransaction) Cbor() []byte {
 	// This should never fail, since we're only encoding a list and a bool value
 	cborData, _ = cbor.Encode(&tmpObj)
 	return cborData
+}
+
+type ShelleyProtocolParameters struct {
+	cbor.StructAsArray
+	MinFeeA            uint
+	MinFeeB            uint
+	MaxBlockBodySize   uint
+	MaxTxSize          uint
+	MaxBlockHeaderSize uint
+	KeyDeposit         uint
+	PoolDeposit        uint
+	MaxEpoch           uint
+	NOpt               uint
+	A0                 *cbor.Rat
+	Rho                *cbor.Rat
+	Tau                *cbor.Rat
+	Decentralization   *cbor.Rat
+	Nonce              *cbor.Rat
+	ProtocolMajor      uint
+	ProtocolMinor      uint
+	MinUtxoValue       uint
+}
+
+type ShelleyProtocolParameterUpdate struct {
+	MinFeeA            uint      `cbor:"0,keyasint"`
+	MinFeeB            uint      `cbor:"1,keyasint"`
+	MaxBlockBodySize   uint      `cbor:"2,keyasint"`
+	MaxTxSize          uint      `cbor:"3,keyasint"`
+	MaxBlockHeaderSize uint      `cbor:"4,keyasint"`
+	KeyDeposit         uint      `cbor:"5,keyasint"`
+	PoolDeposit        uint      `cbor:"6,keyasint"`
+	MaxEpoch           uint      `cbor:"7,keyasint"`
+	NOpt               uint      `cbor:"8,keyasint"`
+	A0                 *cbor.Rat `cbor:"9,keyasint"`
+	Rho                *cbor.Rat `cbor:"10,keyasint"`
+	Tau                *cbor.Rat `cbor:"11,keyasint"`
+	Decentralization   *cbor.Rat `cbor:"12,keyasint"`
+	Nonce              *Nonce    `cbor:"13,keyasint"`
+	ProtocolVersion    struct {
+		cbor.StructAsArray
+		Major uint
+		Minor uint
+	} `cbor:"14,keyasint"`
+	MinUtxoValue uint `cbor:"15,keyasint"`
+}
+
+const (
+	NonceType0 = 0
+	NonceType1 = 1
+)
+
+type Nonce struct {
+	cbor.StructAsArray
+	Type  uint
+	Value [32]byte
+}
+
+func (n *Nonce) UnmarshalCBOR(data []byte) error {
+	nonceType, err := cbor.DecodeIdFromList(data)
+	if err != nil {
+		return err
+	}
+
+	n.Type = uint(nonceType)
+
+	switch nonceType {
+	case NonceType0:
+		// Value uses default value
+	case NonceType1:
+		if err := cbor.DecodeGeneric(data, n); err != nil {
+			fmt.Printf("Nonce decode error: %+v\n", data)
+			return err
+		}
+	default:
+		return fmt.Errorf("unsupported nonce type %d", nonceType)
+	}
+	return nil
 }
 
 func NewShelleyBlockFromCbor(data []byte) (*ShelleyBlock, error) {

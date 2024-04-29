@@ -1,4 +1,4 @@
-// Copyright 2023 Blink Labs Software
+// Copyright 2024 Blink Labs Software
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,12 +21,15 @@ import (
 	"github.com/blinklabs-io/gouroboros/protocol"
 )
 
+// Client implements the TxSubmission client
 type Client struct {
 	*protocol.Protocol
-	config   *Config
-	onceInit sync.Once
+	config          *Config
+	callbackContext CallbackContext
+	onceInit        sync.Once
 }
 
+// NewClient returns a new TxSubmission client object
 func NewClient(protoOptions protocol.ProtocolOptions, cfg *Config) *Client {
 	if cfg == nil {
 		tmpCfg := NewConfig()
@@ -34,6 +37,10 @@ func NewClient(protoOptions protocol.ProtocolOptions, cfg *Config) *Client {
 	}
 	c := &Client{
 		config: cfg,
+	}
+	c.callbackContext = CallbackContext{
+		Client:       c,
+		ConnectionId: protoOptions.ConnectionId,
 	}
 	// Update state map with timeout
 	stateMap := StateMap.Copy()
@@ -93,6 +100,7 @@ func (c *Client) handleRequestTxIds(msg protocol.Message) error {
 	msgRequestTxIds := msg.(*MsgRequestTxIds)
 	// Call the user callback function
 	txIds, err := c.config.RequestTxIdsFunc(
+		c.callbackContext,
 		msgRequestTxIds.Blocking,
 		msgRequestTxIds.Ack,
 		msgRequestTxIds.Req,
@@ -115,7 +123,7 @@ func (c *Client) handleRequestTxs(msg protocol.Message) error {
 	}
 	msgRequestTxs := msg.(*MsgRequestTxs)
 	// Call the user callback function
-	txs, err := c.config.RequestTxsFunc(msgRequestTxs.TxIds)
+	txs, err := c.config.RequestTxsFunc(c.callbackContext, msgRequestTxs.TxIds)
 	if err != nil {
 		return err
 	}

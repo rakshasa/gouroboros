@@ -1,4 +1,4 @@
-// Copyright 2023 Blink Labs Software
+// Copyright 2024 Blink Labs Software
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,14 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package txsubmission implements the Ouroboros TxSubmission protocol
 package txsubmission
 
 import (
 	"time"
 
+	"github.com/blinklabs-io/gouroboros/connection"
 	"github.com/blinklabs-io/gouroboros/protocol"
 )
 
+// Protocol identifiers
 const (
 	ProtocolName        = "tx-submission"
 	ProtocolId   uint16 = 4
@@ -34,6 +37,7 @@ var (
 	stateDone             = protocol.NewState(6, "Done")
 )
 
+// TxSubmission protocol state machine
 var StateMap = protocol.StateMap{
 	stateInit: protocol.StateMapEntry{
 		Agency: protocol.AgencyClient,
@@ -51,7 +55,7 @@ var StateMap = protocol.StateMap{
 				MsgType:  MessageTypeRequestTxIds,
 				NewState: stateTxIdsBlocking,
 				// Match if blocking
-				MatchFunc: func(msg protocol.Message) bool {
+				MatchFunc: func(context interface{}, msg protocol.Message) bool {
 					msgRequestTxIds := msg.(*MsgRequestTxIds)
 					return msgRequestTxIds.Blocking
 				},
@@ -60,7 +64,7 @@ var StateMap = protocol.StateMap{
 				MsgType:  MessageTypeRequestTxIds,
 				NewState: stateTxIdsNonblocking,
 				// Metch if non-blocking
-				MatchFunc: func(msg protocol.Message) bool {
+				MatchFunc: func(context interface{}, msg protocol.Message) bool {
 					msgRequestTxIds := msg.(*MsgRequestTxIds)
 					return !msgRequestTxIds.Blocking
 				},
@@ -107,11 +111,13 @@ var StateMap = protocol.StateMap{
 	},
 }
 
+// TxSubmission is a wrapper object that holds the client and server instances
 type TxSubmission struct {
 	Client *Client
 	Server *Server
 }
 
+// Config is used to configure the TxSubmission protocol instance
 type Config struct {
 	RequestTxIdsFunc RequestTxIdsFunc
 	RequestTxsFunc   RequestTxsFunc
@@ -119,11 +125,19 @@ type Config struct {
 	IdleTimeout      time.Duration
 }
 
-// Callback function types
-type RequestTxIdsFunc func(bool, uint16, uint16) ([]TxIdAndSize, error)
-type RequestTxsFunc func([]TxId) ([]TxBody, error)
-type InitFunc func() error
+// Callback context
+type CallbackContext struct {
+	ConnectionId connection.ConnectionId
+	Client       *Client
+	Server       *Server
+}
 
+// Callback function types
+type RequestTxIdsFunc func(CallbackContext, bool, uint16, uint16) ([]TxIdAndSize, error)
+type RequestTxsFunc func(CallbackContext, []TxId) ([]TxBody, error)
+type InitFunc func(CallbackContext) error
+
+// New returns a new TxSubmission object
 func New(protoOptions protocol.ProtocolOptions, cfg *Config) *TxSubmission {
 	t := &TxSubmission{
 		Client: NewClient(protoOptions, cfg),
@@ -132,8 +146,10 @@ func New(protoOptions protocol.ProtocolOptions, cfg *Config) *TxSubmission {
 	return t
 }
 
+// TxSubmissionOptionFunc represents a function used to modify the TxSubmission protocol config
 type TxSubmissionOptionFunc func(*Config)
 
+// NewConfig returns a new TxSubmission config object with the provided options
 func NewConfig(options ...TxSubmissionOptionFunc) Config {
 	c := Config{
 		IdleTimeout: 300 * time.Second,
@@ -145,6 +161,7 @@ func NewConfig(options ...TxSubmissionOptionFunc) Config {
 	return c
 }
 
+// WithRequestTxIdsFunc specifies the RequestTxIds callback function
 func WithRequestTxIdsFunc(
 	requestTxIdsFunc RequestTxIdsFunc,
 ) TxSubmissionOptionFunc {
@@ -153,18 +170,21 @@ func WithRequestTxIdsFunc(
 	}
 }
 
+// WithRequestTxsFunc specifies the RequestTxs callback function
 func WithRequestTxsFunc(requestTxsFunc RequestTxsFunc) TxSubmissionOptionFunc {
 	return func(c *Config) {
 		c.RequestTxsFunc = requestTxsFunc
 	}
 }
 
+// WithInitFunc specifies the Init callback function
 func WithInitFunc(initFunc InitFunc) TxSubmissionOptionFunc {
 	return func(c *Config) {
 		c.InitFunc = initFunc
 	}
 }
 
+// WithIdleTimeout specifies the timeout for waiting for new transactions from the remote node's mempool
 func WithIdleTimeout(timeout time.Duration) TxSubmissionOptionFunc {
 	return func(c *Config) {
 		c.IdleTimeout = timeout

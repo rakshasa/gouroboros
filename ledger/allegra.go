@@ -71,14 +71,13 @@ func (b *AllegraBlock) Era() Era {
 }
 
 func (b *AllegraBlock) Transactions() []Transaction {
-	ret := []Transaction{}
+	ret := make([]Transaction, len(b.TransactionBodies))
 	for idx := range b.TransactionBodies {
-		tmpTransaction := AllegraTransaction{
+		ret[idx] = &AllegraTransaction{
 			Body:       b.TransactionBodies[idx],
 			WitnessSet: b.TransactionWitnessSets[idx],
 			TxMetadata: b.TransactionMetadataSet[uint(idx)],
 		}
-		ret = append(ret, &tmpTransaction)
 	}
 	return ret
 }
@@ -115,6 +114,11 @@ func (h *AllegraBlockHeader) Era() Era {
 
 type AllegraTransactionBody struct {
 	ShelleyTransactionBody
+	Update struct {
+		cbor.StructAsArray
+		ProtocolParamUpdates map[Blake2b224]AllegraProtocolParameterUpdate
+		Epoch                uint64
+	} `cbor:"6,keyasint,omitempty"`
 	ValidityIntervalStart uint64 `cbor:"8,keyasint,omitempty"`
 }
 
@@ -150,12 +154,20 @@ func (t AllegraTransaction) TTL() uint64 {
 	return t.Body.TTL()
 }
 
+func (t AllegraTransaction) ReferenceInputs() []TransactionInput {
+	return t.Body.ReferenceInputs()
+}
+
 func (t AllegraTransaction) Metadata() *cbor.Value {
 	return t.TxMetadata
 }
 
 func (t AllegraTransaction) Utxorpc() *utxorpc.Tx {
 	return t.Body.Utxorpc()
+}
+
+func (t AllegraTransaction) IsValid() bool {
+	return true
 }
 
 func (t *AllegraTransaction) Cbor() []byte {
@@ -182,6 +194,14 @@ func (t *AllegraTransaction) Cbor() []byte {
 	// This should never fail, since we're only encoding a list and a bool value
 	cborData, _ = cbor.Encode(&tmpObj)
 	return cborData
+}
+
+type AllegraProtocolParameters struct {
+	ShelleyProtocolParameters
+}
+
+type AllegraProtocolParameterUpdate struct {
+	ShelleyProtocolParameterUpdate
 }
 
 func NewAllegraBlockFromCbor(data []byte) (*AllegraBlock, error) {

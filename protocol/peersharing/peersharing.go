@@ -1,4 +1,4 @@
-// Copyright 2023 Blink Labs Software
+// Copyright 2024 Blink Labs Software
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package handshake implements the Ouroboros handshake protocol
+// Package peersharing implements the Ouroboros PeerSharing protocol
 package peersharing
 
 import (
 	"time"
 
+	"github.com/blinklabs-io/gouroboros/connection"
 	"github.com/blinklabs-io/gouroboros/protocol"
 )
 
@@ -70,8 +71,19 @@ type PeerSharing struct {
 
 // Config is used to configure the PeerSharing protocol instance
 type Config struct {
-	Timeout time.Duration
+	ShareRequestFunc ShareRequestFunc
+	Timeout          time.Duration
 }
+
+// Callback context
+type CallbackContext struct {
+	ConnectionId connection.ConnectionId
+	Client       *Client
+	Server       *Server
+}
+
+// Callback function types
+type ShareRequestFunc func(CallbackContext, int) ([]PeerAddress, error)
 
 // New returns a new PeerSharing object
 func New(protoOptions protocol.ProtocolOptions, cfg *Config) *PeerSharing {
@@ -95,6 +107,13 @@ func NewConfig(options ...PeerSharingOptionFunc) Config {
 		option(&c)
 	}
 	return c
+}
+
+// WithShareRequestFunc specifies the ShareRequest callback function
+func WithShareRequestFunc(shareRequestFunc ShareRequestFunc) PeerSharingOptionFunc {
+	return func(c *Config) {
+		c.ShareRequestFunc = shareRequestFunc
+	}
 }
 
 // WithTimeout specifies the timeout for the handshake operation

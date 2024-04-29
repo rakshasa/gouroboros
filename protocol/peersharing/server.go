@@ -1,4 +1,4 @@
-// Copyright 2023 Blink Labs Software
+// Copyright 2024 Blink Labs Software
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,13 +23,18 @@ import (
 // Server implements the PeerSharing server
 type Server struct {
 	*protocol.Protocol
-	config *Config
+	config          *Config
+	callbackContext CallbackContext
 }
 
 // NewServer returns a new PeerSharing server object
 func NewServer(protoOptions protocol.ProtocolOptions, cfg *Config) *Server {
 	s := &Server{
 		config: cfg,
+	}
+	s.callbackContext = CallbackContext{
+		Server:       s,
+		ConnectionId: protoOptions.ConnectionId,
 	}
 	protoConfig := protocol.ProtocolConfig{
 		Name:                ProtocolName,
@@ -64,12 +69,24 @@ func (s *Server) handleMessage(msg protocol.Message) error {
 	return err
 }
 
-// TODO
 func (s *Server) handleShareRequest(msg protocol.Message) error {
+	if s.config == nil || s.config.ShareRequestFunc == nil {
+		return fmt.Errorf(
+			"received peer-sharing ShareRequest message but no callback function is defined",
+		)
+	}
+	msgShareRequest := msg.(*MsgShareRequest)
+	peers, err := s.config.ShareRequestFunc(s.callbackContext, int(msgShareRequest.Amount))
+	if err != nil {
+		return err
+	}
+	msgResp := NewMsgSharePeers(peers)
+	if err := s.SendMessage(msgResp); err != nil {
+		return err
+	}
 	return nil
 }
 
-// TODO
 func (s *Server) handleDone(msg protocol.Message) error {
 	return nil
 }

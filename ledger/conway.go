@@ -72,22 +72,19 @@ func (b *ConwayBlock) Era() Era {
 }
 
 func (b *ConwayBlock) Transactions() []Transaction {
-	ret := []Transaction{}
+	invalidTxMap := make(map[uint]bool, len(b.InvalidTransactions))
+	for _, invalidTxIdx := range b.InvalidTransactions {
+		invalidTxMap[invalidTxIdx] = true
+	}
+
+	ret := make([]Transaction, len(b.TransactionBodies))
 	for idx := range b.TransactionBodies {
-		tmpTransaction := ConwayTransaction{
+		ret[idx] = &ConwayTransaction{
 			Body:       b.TransactionBodies[idx],
 			WitnessSet: b.TransactionWitnessSets[idx],
 			TxMetadata: b.TransactionMetadataSet[uint(idx)],
+			IsTxValid:  !invalidTxMap[uint(idx)],
 		}
-		isValid := true
-		for _, invalidTxIdx := range b.InvalidTransactions {
-			if invalidTxIdx == uint(idx) {
-				isValid = false
-				break
-			}
-		}
-		tmpTransaction.IsValid = isValid
-		ret = append(ret, &tmpTransaction)
 	}
 	return ret
 }
@@ -139,7 +136,7 @@ type ConwayTransaction struct {
 	cbor.DecodeStoreCbor
 	Body       ConwayTransactionBody
 	WitnessSet BabbageTransactionWitnessSet
-	IsValid    bool
+	IsTxValid  bool
 	TxMetadata *cbor.Value
 }
 
@@ -163,8 +160,16 @@ func (t ConwayTransaction) TTL() uint64 {
 	return t.Body.TTL()
 }
 
+func (t ConwayTransaction) ReferenceInputs() []TransactionInput {
+	return t.Body.ReferenceInputs()
+}
+
 func (t ConwayTransaction) Metadata() *cbor.Value {
 	return t.TxMetadata
+}
+
+func (t ConwayTransaction) IsValid() bool {
+	return t.IsTxValid
 }
 
 func (t *ConwayTransaction) Cbor() []byte {

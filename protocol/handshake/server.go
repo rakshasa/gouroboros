@@ -1,4 +1,4 @@
-// Copyright 2023 Blink Labs Software
+// Copyright 2024 Blink Labs Software
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ package handshake
 
 import (
 	"fmt"
+	"sort"
 
 	"github.com/blinklabs-io/gouroboros/protocol"
 )
@@ -23,13 +24,24 @@ import (
 // Server implements the Handshake server
 type Server struct {
 	*protocol.Protocol
-	config *Config
+	config          *Config
+	callbackContext CallbackContext
 }
 
 // NewServer returns a new Handshake server object
 func NewServer(protoOptions protocol.ProtocolOptions, cfg *Config) *Server {
 	s := &Server{
 		config: cfg,
+	}
+	s.callbackContext = CallbackContext{
+		Server:       s,
+		ConnectionId: protoOptions.ConnectionId,
+	}
+	// Update state map with timeout
+	stateMap := StateMap.Copy()
+	if entry, ok := stateMap[statePropose]; ok {
+		entry.Timeout = s.config.Timeout
+		stateMap[statePropose] = entry
 	}
 	protoConfig := protocol.ProtocolConfig{
 		Name:                ProtocolName,
@@ -40,7 +52,7 @@ func NewServer(protoOptions protocol.ProtocolOptions, cfg *Config) *Server {
 		Role:                protocol.ProtocolRoleServer,
 		MessageHandlerFunc:  s.handleMessage,
 		MessageFromCborFunc: NewMsgFromCbor,
-		StateMap:            StateMap,
+		StateMap:            stateMap,
 		InitialState:        statePropose,
 	}
 	s.Protocol = protocol.New(protoConfig)
@@ -82,6 +94,12 @@ func (s *Server) handleProposeVersions(msg protocol.Message) error {
 		for supportedVersion := range s.config.ProtocolVersionMap {
 			supportedVersions = append(supportedVersions, supportedVersion)
 		}
+
+		// sort asending - iterating over map is not deterministic
+		sort.Slice(supportedVersions, func(i, j int) bool {
+			return supportedVersions[i] < supportedVersions[j]
+		})
+
 		msgRefuse := NewMsgRefuse(
 			[]any{
 				RefuseReasonVersionMismatch,
@@ -146,5 +164,5 @@ func (s *Server) handleProposeVersions(msg protocol.Message) error {
 	if err := s.SendMessage(msgAcceptVersion); err != nil {
 		return err
 	}
-	return s.config.FinishedFunc(proposedVersion, proposedVersionData)
+	return s.config.FinishedFunc(s.callbackContext, proposedVersion, proposedVersionData)
 }

@@ -187,6 +187,40 @@ func (a AssetFingerprint) String() string {
 	return encoded
 }
 
+type PoolId [28]byte
+
+func NewPoolIdFromBech32(poolId string) (PoolId, error) {
+	var p PoolId
+	_, data, err := bech32.DecodeNoLimit(poolId)
+	if err != nil {
+		return p, err
+	}
+	decoded, err := bech32.ConvertBits(data, 5, 8, false)
+	if err != nil {
+		return p, err
+	}
+	if len(decoded) != len(p) {
+		return p, fmt.Errorf("invalid pool ID length: %d", len(decoded))
+	}
+	p = PoolId(decoded)
+	return p, err
+}
+
+func (p PoolId) String() string {
+	// Convert data to base32 and encode as bech32
+	convData, err := bech32.ConvertBits(p[:], 8, 5, true)
+	if err != nil {
+		panic(
+			fmt.Sprintf("unexpected error converting data to base32: %s", err),
+		)
+	}
+	encoded, err := bech32.Encode("pool", convData)
+	if err != nil {
+		panic(fmt.Sprintf("unexpected error encoding data as bech32: %s", err))
+	}
+	return encoded
+}
+
 const (
 	AddressHeaderTypeMask    = 0xF0
 	AddressHeaderNetworkMask = 0x0F
@@ -227,7 +261,10 @@ func NewAddress(addr string) (Address, error) {
 		return Address{}, err
 	}
 	a := Address{}
-	a.populateFromBytes(decoded)
+	err = a.populateFromBytes(decoded)
+	if err != nil {
+		return Address{}, err
+	}
 	return a, nil
 }
 
@@ -253,32 +290,45 @@ func NewAddressFromParts(
 }
 
 func (a *Address) populateFromBytes(data []byte) error {
-	// Check length
-	dataLen := len(data)
-	if dataLen < (AddressHashSize + 1) {
-		return fmt.Errorf("invalid address length: %d", dataLen)
-	}
-	if dataLen > (AddressHashSize + 1) {
-		if dataLen < (AddressHashSize + AddressHashSize + 1) {
-			return fmt.Errorf("invalid address length: %d", dataLen)
-		}
-	}
 	// Extract header info
 	header := data[0]
 	a.addressType = (header & AddressHeaderTypeMask) >> 4
 	a.networkId = header & AddressHeaderNetworkMask
+	// Check length
+	// We exclude a few address types without fixed sizes that we don't properly support yet
+	if a.addressType != AddressTypeByron &&
+		a.addressType != AddressTypeKeyPointer &&
+		a.addressType != AddressTypeScriptPointer {
+		dataLen := len(data)
+		// Addresses must be at least the address hash size plus header byte
+		if dataLen < (AddressHashSize + 1) {
+			return fmt.Errorf("invalid address length: %d", dataLen)
+		}
+		// Check bounds of second part if the address type is supposed to have one
+		if a.addressType != AddressTypeKeyNone && a.addressType != AddressTypeScriptNone {
+			if dataLen > (AddressHashSize + 1) {
+				if dataLen < (AddressHashSize + AddressHashSize + 1) {
+					return fmt.Errorf("invalid address length: %d", dataLen)
+				}
+			}
+		}
+	}
 	// Extract payload
-	// NOTE: this is probably incorrect for Byron
+	// NOTE: this is definitely incorrect for Byron
 	payload := data[1:]
 	a.paymentAddress = payload[:AddressHashSize]
-	if len(payload) > AddressHashSize {
-		a.stakingAddress = payload[AddressHashSize : AddressHashSize+AddressHashSize]
+	payload = payload[AddressHashSize:]
+	if a.addressType != AddressTypeKeyNone && a.addressType != AddressTypeScriptNone {
+		if len(payload) >= AddressHashSize {
+			a.stakingAddress = payload[:AddressHashSize]
+			payload = payload[AddressHashSize:]
+		}
 	}
 	// Store any extra address data
 	// This is needed to handle the case describe in:
 	// https://github.com/IntersectMBO/cardano-ledger/issues/2729
-	if len(payload) > (AddressHashSize + AddressHashSize) {
-		a.extraData = payload[AddressHashSize+AddressHashSize:]
+	if len(payload) > 0 {
+		a.extraData = payload[:]
 	}
 	// Adjust stake addresses
 	if a.addressType == AddressTypeNoneKey ||
@@ -290,12 +340,19 @@ func (a *Address) populateFromBytes(data []byte) error {
 }
 
 func (a *Address) UnmarshalCBOR(data []byte) error {
-	// Decode bytes from CBOR
+	// Try to unwrap as bytestring (Shelley and forward)
 	tmpData := []byte{}
-	if _, err := cbor.Decode(data, &tmpData); err != nil {
-		return err
+	if _, err := cbor.Decode(data, &tmpData); err == nil {
+		err := a.populateFromBytes(tmpData)
+		if err != nil {
+			return err
+		}
+	} else {
+		// Probably a Byron address
+		if err := a.populateFromBytes(data); err != nil {
+			return err
+		}
 	}
-	a.populateFromBytes(tmpData)
 	return nil
 }
 

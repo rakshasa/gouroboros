@@ -1,4 +1,4 @@
-// Copyright 2023 Blink Labs Software
+// Copyright 2024 Blink Labs Software
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,9 +24,11 @@ import (
 
 type Client struct {
 	*protocol.Protocol
-	config    *Config
-	timer     *time.Timer
-	onceStart sync.Once
+	config          *Config
+	callbackContext CallbackContext
+	timer           *time.Timer
+	timerMutex      sync.Mutex
+	onceStart       sync.Once
 }
 
 func NewClient(protoOptions protocol.ProtocolOptions, cfg *Config) *Client {
@@ -36,6 +38,10 @@ func NewClient(protoOptions protocol.ProtocolOptions, cfg *Config) *Client {
 	}
 	c := &Client{
 		config: cfg,
+	}
+	c.callbackContext = CallbackContext{
+		Client:       c,
+		ConnectionId: protoOptions.ConnectionId,
 	}
 	// Update state map with timeout
 	stateMap := StateMap.Copy()
@@ -57,20 +63,22 @@ func NewClient(protoOptions protocol.ProtocolOptions, cfg *Config) *Client {
 		InitialState:        StateClient,
 	}
 	c.Protocol = protocol.New(protoConfig)
-	// Start goroutine to cleanup resources on protocol shutdown
-	go func() {
-		<-c.Protocol.DoneChan()
-		// Stop any existing timer
-		if c.timer != nil {
-			c.timer.Stop()
-		}
-	}()
 	return c
 }
 
 func (c *Client) Start() {
 	c.onceStart.Do(func() {
 		c.Protocol.Start()
+		// Start goroutine to cleanup resources on protocol shutdown
+		go func() {
+			<-c.Protocol.DoneChan()
+			// Stop any existing timer
+			c.timerMutex.Lock()
+			if c.timer != nil {
+				c.timer.Stop()
+			}
+			c.timerMutex.Unlock()
+		}()
 		c.sendKeepAlive()
 	})
 }
@@ -85,6 +93,8 @@ func (c *Client) sendKeepAlive() {
 }
 
 func (c *Client) startTimer() {
+	c.timerMutex.Lock()
+	defer c.timerMutex.Unlock()
 	// Stop any existing timer
 	if c.timer != nil {
 		c.timer.Stop()
@@ -110,9 +120,17 @@ func (c *Client) messageHandler(msg protocol.Message) error {
 
 func (c *Client) handleKeepAliveResponse(msgGeneric protocol.Message) error {
 	msg := msgGeneric.(*MsgKeepAliveResponse)
+	if msg.Cookie != c.config.Cookie {
+		return fmt.Errorf(
+			"%s: unexpected cookie in response, expected %d but received %d",
+			ProtocolName,
+			c.config.Cookie,
+			msg.Cookie,
+		)
+	}
 	if c.config != nil && c.config.KeepAliveResponseFunc != nil {
 		// Call the user callback function
-		return c.config.KeepAliveResponseFunc(msg.Cookie)
+		return c.config.KeepAliveResponseFunc(c.callbackContext, msg.Cookie)
 	}
 	return nil
 }

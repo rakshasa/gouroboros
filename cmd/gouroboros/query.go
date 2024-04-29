@@ -15,11 +15,16 @@
 package main
 
 import (
+	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 
 	ouroboros "github.com/blinklabs-io/gouroboros"
+	"github.com/blinklabs-io/gouroboros/ledger"
 	"github.com/blinklabs-io/gouroboros/protocol/localstatequery"
 )
 
@@ -150,7 +155,7 @@ func testQuery(f *globalFlags) {
 			fmt.Printf("ERROR: failure querying protocol params: %s\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("protocol-params: %#v\n", *protoParams)
+		fmt.Printf("protocol-params: %#v\n", protoParams)
 	case "stake-distribution":
 		stakeDistribution, err := o.LocalStateQuery().Client.GetStakeDistribution()
 		if err != nil {
@@ -158,6 +163,13 @@ func testQuery(f *globalFlags) {
 			os.Exit(1)
 		}
 		fmt.Printf("stake-distribution: %#v\n", *stakeDistribution)
+	case "stake-pools":
+		stakePools, err := o.LocalStateQuery().Client.GetStakePools()
+		if err != nil {
+			fmt.Printf("ERROR: failure querying stake pools: %s\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("stake-pools: %#v\n", *stakePools)
 	case "genesis-config":
 		genesisConfig, err := o.LocalStateQuery().Client.GetGenesisConfig()
 		if err != nil {
@@ -165,6 +177,103 @@ func testQuery(f *globalFlags) {
 			os.Exit(1)
 		}
 		fmt.Printf("genesis-config: %#v\n", *genesisConfig)
+	case "pool-params":
+		var tmpPools []ledger.PoolId
+		if len(queryFlags.flagset.Args()) <= 1 {
+			fmt.Println("No pools specified")
+			os.Exit(1)
+		}
+		for _, pool := range queryFlags.flagset.Args()[1:] {
+			tmpPoolId, err := ledger.NewPoolIdFromBech32(pool)
+			if err != nil {
+				fmt.Printf("Invalid bech32 pool ID %q: %s", pool, err)
+				os.Exit(1)
+			}
+			tmpPools = append(tmpPools, tmpPoolId)
+		}
+		poolParams, err := o.LocalStateQuery().Client.GetStakePoolParams(tmpPools)
+		if err != nil {
+			fmt.Printf("ERROR: failure querying stake pool params: %s\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("pool-params: %#v\n", *poolParams)
+	case "utxos-by-address":
+		var tmpAddrs []ledger.Address
+		if len(queryFlags.flagset.Args()) <= 1 {
+			fmt.Println("No addresses specified")
+			os.Exit(1)
+		}
+		for _, addr := range queryFlags.flagset.Args()[1:] {
+			tmpAddr, err := ledger.NewAddress(addr)
+			if err != nil {
+				fmt.Printf("Invalid address %q: %s", addr, err)
+				os.Exit(1)
+			}
+			tmpAddrs = append(tmpAddrs, tmpAddr)
+		}
+		utxos, err := o.LocalStateQuery().Client.GetUTxOByAddress(tmpAddrs)
+		if err != nil {
+			fmt.Printf("ERROR: failure querying UTxOs by address: %s\n", err)
+			os.Exit(1)
+		}
+		for utxoId, utxo := range utxos.Results {
+			fmt.Println("---")
+			fmt.Printf("UTxO ID: %s#%d\n", utxoId.Hash.String(), utxoId.Idx)
+			fmt.Printf("Amount: %d\n", utxo.OutputAmount.Amount)
+			if utxo.OutputAmount.Assets != nil {
+				assetsJson, err := json.Marshal(utxo.OutputAmount.Assets)
+				if err != nil {
+					fmt.Printf("ERROR: failed to marshal asset JSON: %s\n", err)
+					os.Exit(1)
+				}
+				fmt.Printf("Assets: %s\n", assetsJson)
+			}
+		}
+	case "utxos-by-txin":
+		var tmpTxIns []ledger.TransactionInput
+		if len(queryFlags.flagset.Args()) <= 1 {
+			fmt.Println("No UTxO IDs specified")
+			os.Exit(1)
+		}
+		for _, txIn := range queryFlags.flagset.Args()[1:] {
+			txInParts := strings.SplitN(txIn, `#`, 2)
+			if len(txInParts) != 2 {
+				fmt.Printf("Invalid UTxO ID %q", txIn)
+				os.Exit(1)
+			}
+			txIdHex, err := hex.DecodeString(txInParts[0])
+			if err != nil {
+				fmt.Printf("Invalid UTxO ID %q: %s", txIn, err)
+				os.Exit(1)
+			}
+			txOutputIdx, err := strconv.ParseUint(txInParts[1], 10, 32)
+			if err != nil {
+				fmt.Printf("Invalid UTxO ID %q: %s", txIn, err)
+			}
+			tmpTxIn := ledger.ShelleyTransactionInput{
+				TxId:        ledger.Blake2b256(txIdHex),
+				OutputIndex: uint32(txOutputIdx),
+			}
+			tmpTxIns = append(tmpTxIns, tmpTxIn)
+		}
+		utxos, err := o.LocalStateQuery().Client.GetUTxOByTxIn(tmpTxIns)
+		if err != nil {
+			fmt.Printf("ERROR: failure querying UTxOs by TxIn: %s\n", err)
+			os.Exit(1)
+		}
+		for utxoId, utxo := range utxos.Results {
+			fmt.Println("---")
+			fmt.Printf("UTxO ID: %s#%d\n", utxoId.Hash.String(), utxoId.Idx)
+			fmt.Printf("Amount: %d\n", utxo.OutputAmount.Amount)
+			if utxo.OutputAmount.Assets != nil {
+				assetsJson, err := json.Marshal(utxo.OutputAmount.Assets)
+				if err != nil {
+					fmt.Printf("ERROR: failed to marshal asset JSON: %s\n", err)
+					os.Exit(1)
+				}
+				fmt.Printf("Assets: %s\n", assetsJson)
+			}
+		}
 	default:
 		fmt.Printf("ERROR: unknown query: %s\n", queryFlags.flagset.Args()[0])
 		os.Exit(1)

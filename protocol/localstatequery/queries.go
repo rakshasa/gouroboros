@@ -15,7 +15,11 @@
 package localstatequery
 
 import (
+	"fmt"
+	"net"
+
 	"github.com/blinklabs-io/gouroboros/cbor"
+	"github.com/blinklabs-io/gouroboros/ledger"
 )
 
 // Query types
@@ -140,49 +144,83 @@ type eraHistoryResultParams struct {
 }
 
 // TODO
+/*
+result	[{ *[0 int] => non_myopic_rewards }]	for each stake display reward
+non_myopic_rewards	{ *poolid => int }	int is the amount of lovelaces each pool would reward
+*/
 type NonMyopicMemberRewardsResult interface{}
 
-type CurrentProtocolParamsResult struct {
-	// Tells the CBOR decoder to convert to/from a struct and a CBOR array
-	_                  struct{} `cbor:",toarray"`
-	MinFeeA            int
-	MinFeeB            int
-	MaxBlockBodySize   int
-	MaxTxSize          int
-	MaxBlockHeaderSize int
-	KeyDeposit         int
-	PoolDeposit        int
-	EMax               int
-	NOpt               int
-	A0                 []int
-	Rho                []int
-	Tau                []int
-	// This field no longer exists in Babbage, but we're keeping this here for reference
-	// unless we need to support querying a node still on an older era
-	//DecentralizationParam  []int
-	ProtocolVersion struct {
-		// Tells the CBOR decoder to convert to/from a struct and a CBOR array
-		_     struct{} `cbor:",toarray"`
-		Major int
-		Minor int
-	}
-	MinPoolCost            int
-	MinUtxoValue           int
-	CostModels             interface{}
-	ExecutionUnitPrices    interface{} // [priceMemory priceSteps]	both elements are fractions
-	MaxTxExecutionUnits    []uint
-	MaxBlockExecutionUnits []uint
-	MaxValueSize           int
-	CollateralPercentage   int
-	MaxCollateralInputs    int
+type CurrentProtocolParamsResult interface {
+	ledger.BabbageProtocolParameters | any // TODO: add more per-era types
 }
 
 // TODO
 type ProposedProtocolParamsUpdatesResult interface{}
-type StakeDistributionResult interface{}
-type UTxOByAddressResult interface{}
+
+type StakeDistributionResult struct {
+	cbor.StructAsArray
+	Results map[ledger.PoolId]struct {
+		cbor.StructAsArray
+		StakeFraction *cbor.Rat
+		VrfHash       ledger.Blake2b256
+	}
+}
+
+type UTxOByAddressResult struct {
+	cbor.StructAsArray
+	Results map[UtxoId]ledger.BabbageTransactionOutput
+}
+
+type UtxoId struct {
+	cbor.StructAsArray
+	Hash      ledger.Blake2b256
+	Idx       int
+	DatumHash ledger.Blake2b256
+}
+
+func (u *UtxoId) UnmarshalCBOR(data []byte) error {
+	listLen, err := cbor.ListLength(data)
+	if err != nil {
+		return err
+	}
+	switch listLen {
+	case 2:
+		var tmpData struct {
+			cbor.StructAsArray
+			Hash ledger.Blake2b256
+			Idx  int
+		}
+		if _, err := cbor.Decode(data, &tmpData); err != nil {
+			return err
+		}
+		u.Hash = tmpData.Hash
+		u.Idx = tmpData.Idx
+	case 3:
+		return cbor.DecodeGeneric(data, u)
+	default:
+		return fmt.Errorf("invalid list length: %d", listLen)
+	}
+	return nil
+}
+
+// TODO
+/*
+result	[{* utxo => value }]
+*/
 type UTxOWholeResult interface{}
+
+// TODO
 type DebugEpochStateResult interface{}
+
+// TODO
+/*
+rwdr	[flag bytestring]	bytestring is the keyhash of the staking vkey
+flag	0/1	0=keyhash 1=scripthash
+result	[[ delegation rewards] ]
+delegation	{ * rwdr => poolid }	poolid is a bytestring
+rewards	{ * rwdr => int }
+It seems to be a requirement to sort the reward addresses on the query. Scripthash addresses come first, then within a group the bytestring being a network order integer sort ascending.
+*/
 type FilteredDelegationsAndRewardAccountsResult interface{}
 
 type GenesisConfigResult struct {
@@ -229,12 +267,128 @@ type GenesisConfigResult struct {
 
 // TODO
 type DebugNewEpochStateResult interface{}
+
+// TODO
 type DebugChainDepStateResult interface{}
+
+// TODO
+/*
+result	[ *Element ]	Expanded in order on the next rows.
+Element	CDDL	Comment
+epochLength
+poolMints	{ *poolid => block-count }
+maxLovelaceSupply
+NA
+NA
+NA
+?circulatingsupply?
+total-blocks
+?decentralization?	[num den]
+?available block entries
+success-rate	[num den]
+NA
+NA		??treasuryCut
+activeStakeGo
+nil
+nil
+*/
 type RewardProvenanceResult interface{}
-type UTxOByTxInResult interface{}
-type StakePoolsResult interface{}
-type StakePoolParamsResult interface{}
+
+type UTxOByTxInResult struct {
+	cbor.StructAsArray
+	Results map[UtxoId]ledger.BabbageTransactionOutput
+}
+
+type StakePoolsResult struct {
+	cbor.StructAsArray
+	Results []ledger.PoolId
+}
+
+type StakePoolParamsResult struct {
+	cbor.StructAsArray
+	Results map[ledger.PoolId]struct {
+		cbor.StructAsArray
+		Operator      ledger.Blake2b224
+		VrfKeyHash    ledger.Blake2b256
+		Pledge        uint
+		FixedCost     uint
+		Margin        *cbor.Rat
+		RewardAccount ledger.Address
+		PoolOwners    []ledger.Blake2b224
+		Relays        []StakePoolParamsResultRelay
+		PoolMetadata  *struct {
+			cbor.StructAsArray
+			Url          string
+			MetadataHash ledger.Blake2b256
+		}
+	}
+}
+
+type StakePoolParamsResultRelay struct {
+	Type     int
+	Port     *uint
+	Ipv4     *net.IP
+	Ipv6     *net.IP
+	Hostname *string
+}
+
+func (s *StakePoolParamsResultRelay) UnmarshalCBOR(data []byte) error {
+	tmpId, err := cbor.DecodeIdFromList(data)
+	if err != nil {
+		return err
+	}
+	s.Type = tmpId
+	switch tmpId {
+	case 0:
+		var tmpData struct {
+			cbor.StructAsArray
+			Type uint
+			Port *uint
+			Ipv4 *net.IP
+			Ipv6 *net.IP
+		}
+		if _, err := cbor.Decode(data, &tmpData); err != nil {
+			return err
+		}
+		s.Port = tmpData.Port
+		s.Ipv4 = tmpData.Ipv4
+		s.Ipv6 = tmpData.Ipv6
+	case 1:
+		var tmpData struct {
+			cbor.StructAsArray
+			Type     uint
+			Port     *uint
+			Hostname *string
+		}
+		if _, err := cbor.Decode(data, &tmpData); err != nil {
+			return err
+		}
+		s.Port = tmpData.Port
+		s.Hostname = tmpData.Hostname
+	case 2:
+		var tmpData struct {
+			cbor.StructAsArray
+			Type     uint
+			Hostname *string
+		}
+		if _, err := cbor.Decode(data, &tmpData); err != nil {
+			return err
+		}
+		s.Hostname = tmpData.Hostname
+	default:
+		return fmt.Errorf("invalid relay type: %d", tmpId)
+	}
+	return nil
+}
+
+// TODO
 type RewardInfoPoolsResult interface{}
+
+// TODO
 type PoolStateResult interface{}
+
+// TODO
 type StakeSnapshotsResult interface{}
+
+// TODO
 type PoolDistrResult interface{}

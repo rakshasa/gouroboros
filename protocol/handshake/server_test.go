@@ -17,22 +17,24 @@ package handshake_test
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	ouroboros "github.com/blinklabs-io/gouroboros"
-	"github.com/blinklabs-io/gouroboros/internal/test/ouroboros_mock"
 	"github.com/blinklabs-io/gouroboros/protocol"
 	"github.com/blinklabs-io/gouroboros/protocol/handshake"
+	ouroboros_mock "github.com/blinklabs-io/ouroboros-mock"
+	"go.uber.org/goleak"
 )
 
 func TestServerBasicHandshake(t *testing.T) {
+	defer goleak.VerifyNone(t)
 	mockConn := ouroboros_mock.NewConnection(
 		ouroboros_mock.ProtocolRoleServer,
 		[]ouroboros_mock.ConversationEntry{
 			// MsgProposeVersions from mock client
-			{
-				Type:       ouroboros_mock.EntryTypeOutput,
+			ouroboros_mock.ConversationEntryOutput{
 				ProtocolId: handshake.ProtocolId,
-				OutputMessages: []protocol.Message{
+				Messages: []protocol.Message{
 					handshake.NewMsgProposeVersions(
 						protocol.ProtocolVersionMap{
 							(10 + protocol.ProtocolVersionNtCOffset): protocol.VersionDataNtC9to14(ouroboros_mock.MockNetworkMagic),
@@ -43,12 +45,11 @@ func TestServerBasicHandshake(t *testing.T) {
 				},
 			},
 			// MsgAcceptVersion from server
-			{
-				Type:            ouroboros_mock.EntryTypeInput,
-				IsResponse:      true,
+			ouroboros_mock.ConversationEntryInput{
 				ProtocolId:      handshake.ProtocolId,
+				IsResponse:      true,
 				MsgFromCborFunc: handshake.NewMsgFromCbor,
-				InputMessage: handshake.NewMsgAcceptVersion(
+				Message: handshake.NewMsgAcceptVersion(
 					(12 + protocol.ProtocolVersionNtCOffset),
 					protocol.VersionDataNtC9to14(ouroboros_mock.MockNetworkMagic),
 				),
@@ -76,18 +77,26 @@ func TestServerBasicHandshake(t *testing.T) {
 	if err := oConn.Close(); err != nil {
 		t.Fatalf("unexpected error when closing Ouroboros object: %s", err)
 	}
+	// Wait for connection shutdown
+	select {
+	case <-oConn.ErrorChan():
+	case <-time.After(10 * time.Second):
+		t.Errorf("did not shutdown within timeout")
+	}
 }
 
 func TestServerHandshakeRefuseVersionMismatch(t *testing.T) {
+	defer func() {
+		goleak.VerifyNone(t)
+	}()
 	expectedErr := fmt.Errorf("handshake failed: refused due to version mismatch")
 	mockConn := ouroboros_mock.NewConnection(
 		ouroboros_mock.ProtocolRoleServer,
 		[]ouroboros_mock.ConversationEntry{
 			// MsgProposeVersions from mock client
-			{
-				Type:       ouroboros_mock.EntryTypeOutput,
+			ouroboros_mock.ConversationEntryOutput{
 				ProtocolId: handshake.ProtocolId,
-				OutputMessages: []protocol.Message{
+				Messages: []protocol.Message{
 					handshake.NewMsgProposeVersions(
 						protocol.ProtocolVersionMap{
 							(100 + protocol.ProtocolVersionNtCOffset): protocol.VersionDataNtC9to14(ouroboros_mock.MockNetworkMagic),
@@ -98,16 +107,22 @@ func TestServerHandshakeRefuseVersionMismatch(t *testing.T) {
 				},
 			},
 			// MsgRefuse from server
-			{
-				Type:             ouroboros_mock.EntryTypeInput,
-				IsResponse:       true,
-				ProtocolId:       handshake.ProtocolId,
-				MsgFromCborFunc:  handshake.NewMsgFromCbor,
-				InputMessageType: handshake.MessageTypeRefuse,
-				InputMessage: handshake.NewMsgRefuse(
+			ouroboros_mock.ConversationEntryInput{
+				IsResponse:      true,
+				ProtocolId:      handshake.ProtocolId,
+				MsgFromCborFunc: handshake.NewMsgFromCbor,
+				MessageType:     handshake.MessageTypeRefuse,
+				Message: handshake.NewMsgRefuse(
 					[]any{
 						handshake.RefuseReasonVersionMismatch,
-						protocol.GetProtocolVersionsNtC(),
+						// Convert []uint16 to []any
+						func(in []uint16) []any {
+							var ret []any
+							for _, item := range in {
+								ret = append(ret, uint64(item))
+							}
+							return ret
+						}(protocol.GetProtocolVersionsNtC()),
 					},
 				),
 			},
@@ -124,6 +139,12 @@ func TestServerHandshakeRefuseVersionMismatch(t *testing.T) {
 		}
 	} else {
 		oConn.Close()
+		// Wait for connection shutdown
+		select {
+		case <-oConn.ErrorChan():
+		case <-time.After(10 * time.Second):
+			t.Errorf("did not shutdown within timeout")
+		}
 		t.Fatalf("did not receive expected error")
 	}
 }

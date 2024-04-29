@@ -1,4 +1,4 @@
-// Copyright 2023 Blink Labs Software
+// Copyright 2024 Blink Labs Software
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -281,6 +281,11 @@ func testChainSync(f *globalFlags) {
 			fmt.Printf("ERROR: failed to get available block range: %s\n", err)
 			os.Exit(1)
 		}
+		// Stop the chain-sync client to prevent the connection getting closed due to chain-sync idle timeout
+		if err := oConn.ChainSync().Client.Stop(); err != nil {
+			fmt.Printf("ERROR: failed to shutdown chain-sync: %s\n", err)
+			os.Exit(1)
+		}
 		if err := oConn.BlockFetch().Client.GetBlockRange(start, end); err != nil {
 			fmt.Printf("ERROR: failed to request block range: %s\n", err)
 			os.Exit(1)
@@ -290,12 +295,13 @@ func testChainSync(f *globalFlags) {
 	select {}
 }
 
-func chainSyncRollBackwardHandler(point common.Point, tip chainsync.Tip) error {
+func chainSyncRollBackwardHandler(ctx chainsync.CallbackContext, point common.Point, tip chainsync.Tip) error {
 	fmt.Printf("roll backward: point = %#v, tip = %#v\n", point, tip)
 	return nil
 }
 
 func chainSyncRollForwardHandler(
+	ctx chainsync.CallbackContext,
 	blockType uint,
 	blockData interface{},
 	tip chainsync.Tip,
@@ -346,7 +352,7 @@ func chainSyncRollForwardHandler(
 	return nil
 }
 
-func blockFetchBlockHandler(blockData ledger.Block) error {
+func blockFetchBlockHandler(ctx blockfetch.CallbackContext, blockData ledger.Block) error {
 	switch block := blockData.(type) {
 	case *ledger.ByronEpochBoundaryBlock:
 		fmt.Printf("era = Byron (EBB), epoch = %d, slot = %d, id = %s\n", block.Header.ConsensusData.Epoch, block.SlotNumber(), block.Hash())

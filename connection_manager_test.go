@@ -20,8 +20,9 @@ import (
 	"time"
 
 	ouroboros "github.com/blinklabs-io/gouroboros"
-	"github.com/blinklabs-io/gouroboros/internal/test/ouroboros_mock"
 	"github.com/blinklabs-io/gouroboros/protocol/keepalive"
+	ouroboros_mock "github.com/blinklabs-io/ouroboros-mock"
+	"go.uber.org/goleak"
 )
 
 func TestConnectionManagerTagString(t *testing.T) {
@@ -46,25 +47,29 @@ func TestConnectionManagerTagString(t *testing.T) {
 }
 
 func TestConnectionManagerConnError(t *testing.T) {
-	expectedConnId := 2
+	defer goleak.VerifyNone(t)
+	var expectedConnId ouroboros.ConnectionId
 	expectedErr := io.EOF
 	doneChan := make(chan any)
 	connManager := ouroboros.NewConnectionManager(
 		ouroboros.ConnectionManagerConfig{
-			ConnClosedFunc: func(connId int, err error) {
-				if connId != expectedConnId {
-					t.Fatalf("did not receive error from expected connection: got %d, wanted %d", connId, expectedConnId)
+			ConnClosedFunc: func(connId ouroboros.ConnectionId, err error) {
+				if err != nil {
+					if connId != expectedConnId {
+						t.Fatalf("did not receive error from expected connection: got %d, wanted %d", connId, expectedConnId)
+					}
+					if err != expectedErr {
+						t.Fatalf("did not receive expected error: got: %s, expected: %s", err, expectedErr)
+					}
+					close(doneChan)
 				}
-				if err != expectedErr {
-					t.Fatalf("did not receive expected error: got: %s, expected: %s", err, expectedErr)
-				}
-				close(doneChan)
 			},
 		},
 	)
+	testIdx := 2
 	for i := 0; i < 3; i++ {
 		mockConversation := ouroboros_mock.ConversationKeepAlive
-		if i == expectedConnId {
+		if i == testIdx {
 			mockConversation = ouroboros_mock.ConversationKeepAliveClose
 		}
 		mockConn := ouroboros_mock.NewConnection(
@@ -87,10 +92,21 @@ func TestConnectionManagerConnError(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error when creating Ouroboros object: %s", err)
 		}
-		connManager.AddConnection(i, oConn)
+		if i == testIdx {
+			expectedConnId = oConn.Id()
+		}
+		connManager.AddConnection(oConn)
 	}
 	select {
 	case <-doneChan:
+		// Shutdown other connections
+		for _, tmpConn := range connManager.GetConnectionsByTags() {
+			if tmpConn.Conn.Id() != expectedConnId {
+				tmpConn.Conn.Close()
+			}
+		}
+		// TODO: actually wait for shutdown
+		time.Sleep(5 * time.Second)
 		return
 	case <-time.After(10 * time.Second):
 		t.Fatalf("did not receive error within timeout")
@@ -98,11 +114,12 @@ func TestConnectionManagerConnError(t *testing.T) {
 }
 
 func TestConnectionManagerConnClosed(t *testing.T) {
-	expectedConnId := 42
+	defer goleak.VerifyNone(t)
+	var expectedConnId ouroboros.ConnectionId
 	doneChan := make(chan any)
 	connManager := ouroboros.NewConnectionManager(
 		ouroboros.ConnectionManagerConfig{
-			ConnClosedFunc: func(connId int, err error) {
+			ConnClosedFunc: func(connId ouroboros.ConnectionId, err error) {
 				if connId != expectedConnId {
 					t.Fatalf("did not receive closed signal from expected connection: got %d, wanted %d", connId, expectedConnId)
 				}
@@ -129,7 +146,8 @@ func TestConnectionManagerConnClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error when creating Ouroboros object: %s", err)
 	}
-	connManager.AddConnection(expectedConnId, oConn)
+	expectedConnId = oConn.Id()
+	connManager.AddConnection(oConn)
 	time.AfterFunc(
 		1*time.Second,
 		func() {
@@ -138,6 +156,8 @@ func TestConnectionManagerConnClosed(t *testing.T) {
 	)
 	select {
 	case <-doneChan:
+		// TODO: actually wait for shutdown
+		time.Sleep(5 * time.Second)
 		return
 	case <-time.After(10 * time.Second):
 		t.Fatalf("did not receive error within timeout")

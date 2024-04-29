@@ -1,4 +1,4 @@
-// Copyright 2023 Blink Labs Software
+// Copyright 2024 Blink Labs Software
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/blinklabs-io/gouroboros/connection"
 	"github.com/blinklabs-io/gouroboros/muxer"
 	"github.com/blinklabs-io/gouroboros/protocol"
 	"github.com/blinklabs-io/gouroboros/protocol/blockfetch"
@@ -49,8 +50,11 @@ const (
 	DefaultConnectTimeout = 30 * time.Second
 )
 
+type ConnectionId = connection.ConnectionId
+
 // The Connection type is a wrapper around a net.Conn object that handles communication using the Ouroboros network protocol over that connection
 type Connection struct {
+	id                    ConnectionId
 	conn                  net.Conn
 	networkMagic          uint32
 	server                bool
@@ -59,6 +63,8 @@ type Connection struct {
 	errorChan             chan error
 	protoErrorChan        chan error
 	handshakeFinishedChan chan interface{}
+	handshakeVersion      uint16
+	handshakeVersionData  protocol.VersionData
 	doneChan              chan interface{}
 	waitGroup             sync.WaitGroup
 	onceClose             sync.Once
@@ -66,6 +72,7 @@ type Connection struct {
 	delayMuxerStart       bool
 	delayProtocolStart    bool
 	fullDuplex            bool
+	peerSharingEnabled    bool
 	// Mini-protocols
 	blockFetch              *blockfetch.BlockFetch
 	blockFetchConfig        *blockfetch.Config
@@ -112,6 +119,11 @@ func NewConnection(options ...ConnectionOptionFunc) (*Connection, error) {
 // New is an alias to NewConnection for backward compatibility
 func New(options ...ConnectionOptionFunc) (*Connection, error) {
 	return NewConnection(options...)
+}
+
+// Id returns the connection ID
+func (c *Connection) Id() ConnectionId {
+	return c.id
 }
 
 // Muxer returns the muxer object for the Ouroboros connection
@@ -204,11 +216,19 @@ func (c *Connection) TxSubmission() *txsubmission.TxSubmission {
 	return c.txSubmission
 }
 
+// ProtocolVersion returns the negotiated protocol version and the version data from the remote peer
+func (c *Connection) ProtocolVersion() (uint16, protocol.VersionData) {
+	return c.handshakeVersion, c.handshakeVersionData
+}
+
 // shutdown performs cleanup operations when the connection is shutdown, either due to explicit Close() or an error
 func (c *Connection) shutdown() {
 	// Gracefully stop the muxer
 	if c.muxer != nil {
 		c.muxer.Stop()
+	}
+	if c.chainSync != nil {
+		c.chainSync.Client.Stop()
 	}
 	// Wait for other goroutines to finish
 	c.waitGroup.Wait()
@@ -231,6 +251,11 @@ func (c *Connection) setupConnection() error {
 		<-c.doneChan
 		c.shutdown()
 	}()
+	// Populate connection ID
+	c.id = ConnectionId{
+		LocalAddr:  c.conn.LocalAddr(),
+		RemoteAddr: c.conn.RemoteAddr(),
+	}
 	// Create muxer instance
 	c.muxer = muxer.New(c.conn)
 	// Start Goroutine to pass along errors from the muxer
@@ -257,8 +282,9 @@ func (c *Connection) setupConnection() error {
 		}
 	}()
 	protoOptions := protocol.ProtocolOptions{
-		Muxer:     c.muxer,
-		ErrorChan: c.protoErrorChan,
+		ConnectionId: c.id,
+		Muxer:        c.muxer,
+		ErrorChan:    c.protoErrorChan,
 	}
 	if c.useNodeToNodeProto {
 		protoOptions.Mode = protocol.ProtocolModeNodeToNode
@@ -279,17 +305,17 @@ func (c *Connection) setupConnection() error {
 		protoOptions.Mode,
 		c.networkMagic,
 		handshakeDiffusionMode,
-		// TODO: make these configurable
-		protocol.PeerSharingModeNoPeerSharing,
+		c.peerSharingEnabled,
+		// TODO: make this configurable
 		protocol.QueryModeDisabled,
 	)
 	// Perform handshake
-	var handshakeVersion uint16
 	var handshakeFullDuplex bool
 	handshakeConfig := handshake.NewConfig(
 		handshake.WithProtocolVersionMap(protoVersions),
-		handshake.WithFinishedFunc(func(version uint16, versionData protocol.VersionData) error {
-			handshakeVersion = version
+		handshake.WithFinishedFunc(func(ctx handshake.CallbackContext, version uint16, versionData protocol.VersionData) error {
+			c.handshakeVersion = version
+			c.handshakeVersionData = versionData
 			if c.useNodeToNodeProto {
 				if versionData.DiffusionMode() == protocol.DiffusionModeInitiatorAndResponder {
 					handshakeFullDuplex = true
@@ -318,7 +344,7 @@ func (c *Connection) setupConnection() error {
 		// This is purposely empty, but we need this case to break out when this channel is closed
 	}
 	// Provide the negotiated protocol version to the various mini-protocols
-	protoOptions.Version = handshakeVersion
+	protoOptions.Version = c.handshakeVersion
 	// Start Goroutine to pass along errors from the mini-protocols
 	c.waitGroup.Add(1)
 	go func() {
@@ -339,7 +365,7 @@ func (c *Connection) setupConnection() error {
 	}()
 	// Configure the relevant mini-protocols
 	if c.useNodeToNodeProto {
-		versionNtN := protocol.GetProtocolVersion(handshakeVersion)
+		versionNtN := protocol.GetProtocolVersion(c.handshakeVersion)
 		protoOptions.Mode = protocol.ProtocolModeNodeToNode
 		c.chainSync = chainsync.New(protoOptions, c.chainSyncConfig)
 		c.blockFetch = blockfetch.New(protoOptions, c.blockFetchConfig)
@@ -376,7 +402,7 @@ func (c *Connection) setupConnection() error {
 			}
 		}
 	} else {
-		versionNtC := protocol.GetProtocolVersion(handshakeVersion)
+		versionNtC := protocol.GetProtocolVersion(c.handshakeVersion)
 		protoOptions.Mode = protocol.ProtocolModeNodeToClient
 		c.chainSync = chainsync.New(protoOptions, c.chainSyncConfig)
 		c.localTxSubmission = localtxsubmission.New(protoOptions, c.localTxSubmissionConfig)

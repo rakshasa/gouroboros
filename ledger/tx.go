@@ -27,6 +27,7 @@ import (
 type Transaction interface {
 	TransactionBody
 	Metadata() *cbor.Value
+	IsValid() bool
 }
 
 type TransactionBody interface {
@@ -36,6 +37,7 @@ type TransactionBody interface {
 	Inputs() []TransactionInput
 	Outputs() []TransactionOutput
 	TTL() uint64
+	ReferenceInputs() []TransactionInput
 	Utxorpc() *utxorpc.Tx
 }
 

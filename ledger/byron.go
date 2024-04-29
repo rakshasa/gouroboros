@@ -1,4 +1,4 @@
-// Copyright 2023 Blink Labs Software
+// Copyright 2024 Blink Labs Software
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -76,6 +76,7 @@ type ByronMainBlockHeader struct {
 }
 
 func (h *ByronMainBlockHeader) UnmarshalCBOR(cborData []byte) error {
+	// Decode generically and store original CBOR
 	return h.UnmarshalCbor(cborData, h)
 }
 
@@ -107,11 +108,11 @@ func (h *ByronMainBlockHeader) SlotNumber() uint64 {
 
 func (h *ByronMainBlockHeader) IssuerVkey() IssuerVkey {
 	// Byron blocks don't have an issuer
-	return IssuerVkey([]byte{})
+	return IssuerVkey{}
 }
 
 func (h *ByronMainBlockHeader) BlockBodySize() uint64 {
-	// TODO: calculate this
+	// Byron doesn't include the block body size in the header
 	return 0
 }
 
@@ -122,47 +123,181 @@ func (h *ByronMainBlockHeader) Era() Era {
 type ByronTransaction struct {
 	cbor.StructAsArray
 	cbor.DecodeStoreCbor
-	// TODO: flesh these out
-	TxInputs   []any
-	TxOutputs  []any
+	hash       string
+	TxInputs   []ByronTransactionInput
+	TxOutputs  []ByronTransactionOutput
 	Attributes *cbor.Value
 }
 
+func (t *ByronTransaction) UnmarshalCBOR(data []byte) error {
+	// Decode generically and store original CBOR
+	return t.UnmarshalCbor(data, t)
+}
+
 func (t *ByronTransaction) Hash() string {
-	// TODO
-	return ""
+	if t.hash == "" {
+		t.hash = generateTransactionHash(t.Cbor(), nil)
+	}
+	return t.hash
 }
 
 func (t *ByronTransaction) Inputs() []TransactionInput {
-	// TODO
-	return nil
+	ret := []TransactionInput{}
+	for _, input := range t.TxInputs {
+		ret = append(ret, input)
+	}
+	return ret
 }
 
 func (t *ByronTransaction) Outputs() []TransactionOutput {
-	// TODO
-	return nil
+	ret := []TransactionOutput{}
+	for _, output := range t.TxOutputs {
+		output := output
+		ret = append(ret, &output)
+	}
+	return ret
 }
 
 func (t *ByronTransaction) Fee() uint64 {
-	// TODO
+	// The fee is implicit in Byron, and we don't have enough information here to calculate it.
+	// You need to know the Lovelace in the inputs to determine the fee, and that information is
+	// not provided directly in the TX
 	return 0
 }
 
 func (t *ByronTransaction) TTL() uint64 {
-	// TODO
+	// No TTL in Byron
 	return 0
+}
+
+func (t *ByronTransaction) ReferenceInputs() []TransactionInput {
+	// No reference inputs in Byron
+	return nil
 }
 
 func (t *ByronTransaction) Metadata() *cbor.Value {
 	return t.Attributes
 }
 
+func (t *ByronTransaction) IsValid() bool {
+	return true
+}
+
 func (t *ByronTransaction) Utxorpc() *utxorpc.Tx {
 	return &utxorpc.Tx{}
 }
 
+type ByronTransactionInput struct {
+	cbor.StructAsArray
+	TxId        Blake2b256
+	OutputIndex uint32
+}
+
+func (i *ByronTransactionInput) UnmarshalCBOR(data []byte) error {
+	id, err := cbor.DecodeIdFromList(data)
+	if err != nil {
+		return err
+	}
+	switch id {
+	case 0:
+		var tmpData struct {
+			cbor.StructAsArray
+			Id   int
+			Cbor []byte
+		}
+		if _, err := cbor.Decode(data, &tmpData); err != nil {
+			return err
+		}
+		if err := cbor.DecodeGeneric(tmpData.Cbor, i); err != nil {
+			return err
+		}
+	default:
+		// [u8 .ne 0, encoded-cbor]
+		return fmt.Errorf("can't parse yet")
+	}
+	return nil
+}
+
+func (i ByronTransactionInput) Id() Blake2b256 {
+	return i.TxId
+}
+
+func (i ByronTransactionInput) Index() uint32 {
+	return i.OutputIndex
+}
+
+func (i ByronTransactionInput) Utxorpc() *utxorpc.TxInput {
+	return &utxorpc.TxInput{
+		TxHash:      i.TxId.Bytes(),
+		OutputIndex: i.OutputIndex,
+		// AsOutput: i.AsOutput,
+		// Redeemer: i.Redeemer,
+	}
+}
+
+func (i ByronTransactionInput) String() string {
+	return fmt.Sprintf("%s#%d", i.TxId, i.OutputIndex)
+}
+
+func (i ByronTransactionInput) MarshalJSON() ([]byte, error) {
+	return []byte("\"" + i.String() + "\""), nil
+}
+
+type ByronTransactionOutput struct {
+	cbor.StructAsArray
+	cbor.DecodeStoreCbor
+	OutputAddress Address `json:"address"`
+	OutputAmount  uint64  `json:"amount"`
+}
+
+func (o *ByronTransactionOutput) UnmarshalCBOR(data []byte) error {
+	// Save original CBOR
+	o.SetCbor(data)
+	var tmpData struct {
+		cbor.StructAsArray
+		WrappedAddress cbor.RawMessage
+		Amount         uint64
+	}
+	if _, err := cbor.Decode(data, &tmpData); err != nil {
+		return err
+	}
+	o.OutputAmount = tmpData.Amount
+	if _, err := cbor.Decode(tmpData.WrappedAddress, &o.OutputAddress); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (o ByronTransactionOutput) Address() Address {
+	return o.OutputAddress
+}
+
+func (o ByronTransactionOutput) Amount() uint64 {
+	return o.OutputAmount
+}
+
+func (o ByronTransactionOutput) Assets() *MultiAsset[MultiAssetTypeOutput] {
+	return nil
+}
+
+func (o ByronTransactionOutput) DatumHash() *Blake2b256 {
+	return nil
+}
+
+func (o ByronTransactionOutput) Datum() *cbor.LazyValue {
+	return nil
+}
+
+func (o ByronTransactionOutput) Utxorpc() *utxorpc.TxOutput {
+	return &utxorpc.TxOutput{
+		Address: o.OutputAddress.Bytes(),
+		Coin:    o.Amount(),
+	}
+}
+
 type ByronMainBlockBody struct {
 	cbor.StructAsArray
+	cbor.DecodeStoreCbor
 	// TODO: split this to its own type
 	TxPayload []struct {
 		cbor.StructAsArray
@@ -173,6 +308,11 @@ type ByronMainBlockBody struct {
 	SscPayload cbor.Value
 	DlgPayload []interface{}
 	UpdPayload []interface{}
+}
+
+func (b *ByronMainBlockBody) UnmarshalCBOR(data []byte) error {
+	// Decode generically and store original CBOR
+	return b.UnmarshalCbor(data, b)
 }
 
 type ByronEpochBoundaryBlockHeader struct {
@@ -194,6 +334,7 @@ type ByronEpochBoundaryBlockHeader struct {
 }
 
 func (h *ByronEpochBoundaryBlockHeader) UnmarshalCBOR(cborData []byte) error {
+	// Decode generically and store original CBOR
 	return h.UnmarshalCbor(cborData, h)
 }
 
@@ -225,7 +366,7 @@ func (h *ByronEpochBoundaryBlockHeader) IssuerVkey() IssuerVkey {
 }
 
 func (h *ByronEpochBoundaryBlockHeader) BlockBodySize() uint64 {
-	// TODO: calculate this
+	// Byron doesn't include the block body size in the header
 	return 0
 }
 
@@ -242,6 +383,7 @@ type ByronMainBlock struct {
 }
 
 func (b *ByronMainBlock) UnmarshalCBOR(cborData []byte) error {
+	// Decode generically and store original CBOR
 	return b.UnmarshalCbor(cborData, b)
 }
 
@@ -262,7 +404,7 @@ func (b *ByronMainBlock) IssuerVkey() IssuerVkey {
 }
 
 func (b *ByronMainBlock) BlockBodySize() uint64 {
-	return b.Header.BlockBodySize()
+	return uint64(len(b.Body.Cbor()))
 }
 
 func (b *ByronMainBlock) Era() Era {
@@ -270,8 +412,12 @@ func (b *ByronMainBlock) Era() Era {
 }
 
 func (b *ByronMainBlock) Transactions() []Transaction {
-	// TODO
-	return nil
+	ret := make([]Transaction, len(b.Body.TxPayload))
+	for idx, payload := range b.Body.TxPayload {
+		payload := payload
+		ret[idx] = &payload.Transaction
+	}
+	return ret
 }
 
 func (b *ByronMainBlock) Utxorpc() *utxorpc.Block {
@@ -287,6 +433,7 @@ type ByronEpochBoundaryBlock struct {
 }
 
 func (b *ByronEpochBoundaryBlock) UnmarshalCBOR(cborData []byte) error {
+	// Decode generically and store original CBOR
 	return b.UnmarshalCbor(cborData, b)
 }
 
@@ -307,7 +454,8 @@ func (b *ByronEpochBoundaryBlock) IssuerVkey() IssuerVkey {
 }
 
 func (b *ByronEpochBoundaryBlock) BlockBodySize() uint64 {
-	return b.Header.BlockBodySize()
+	// There's not really a body for an epoch boundary block
+	return 0
 }
 
 func (b *ByronEpochBoundaryBlock) Era() Era {

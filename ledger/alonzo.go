@@ -73,22 +73,19 @@ func (b *AlonzoBlock) Era() Era {
 }
 
 func (b *AlonzoBlock) Transactions() []Transaction {
-	ret := []Transaction{}
+	invalidTxMap := make(map[uint]bool, len(b.InvalidTransactions))
+	for _, invalidTxIdx := range b.InvalidTransactions {
+		invalidTxMap[invalidTxIdx] = true
+	}
+
+	ret := make([]Transaction, len(b.TransactionBodies))
 	for idx := range b.TransactionBodies {
-		tmpTransaction := AlonzoTransaction{
+		ret[idx] = &AlonzoTransaction{
 			Body:       b.TransactionBodies[idx],
 			WitnessSet: b.TransactionWitnessSets[idx],
 			TxMetadata: b.TransactionMetadataSet[uint(idx)],
+			IsTxValid:  !invalidTxMap[uint(idx)],
 		}
-		isValid := true
-		for _, invalidTxIdx := range b.InvalidTransactions {
-			if invalidTxIdx == uint(idx) {
-				isValid = false
-				break
-			}
-		}
-		tmpTransaction.IsValid = isValid
-		ret = append(ret, &tmpTransaction)
 	}
 	return ret
 }
@@ -125,7 +122,12 @@ func (h *AlonzoBlockHeader) Era() Era {
 
 type AlonzoTransactionBody struct {
 	MaryTransactionBody
-	TxOutputs       []AlonzoTransactionOutput `cbor:"1,keyasint,omitempty"`
+	TxOutputs []AlonzoTransactionOutput `cbor:"1,keyasint,omitempty"`
+	Update    struct {
+		cbor.StructAsArray
+		ProtocolParamUpdates map[Blake2b224]AlonzoProtocolParameterUpdate
+		Epoch                uint64
+	} `cbor:"6,keyasint,omitempty"`
 	ScriptDataHash  Blake2b256                `cbor:"11,keyasint,omitempty"`
 	Collateral      []ShelleyTransactionInput `cbor:"13,keyasint,omitempty"`
 	RequiredSigners []Blake2b224              `cbor:"14,keyasint,omitempty"`
@@ -230,7 +232,7 @@ type AlonzoTransaction struct {
 	cbor.DecodeStoreCbor
 	Body       AlonzoTransactionBody
 	WitnessSet AlonzoTransactionWitnessSet
-	IsValid    bool
+	IsTxValid  bool
 	TxMetadata *cbor.Value
 }
 
@@ -254,8 +256,16 @@ func (t AlonzoTransaction) TTL() uint64 {
 	return t.Body.TTL()
 }
 
+func (t AlonzoTransaction) ReferenceInputs() []TransactionInput {
+	return t.Body.ReferenceInputs()
+}
+
 func (t AlonzoTransaction) Metadata() *cbor.Value {
 	return t.TxMetadata
+}
+
+func (t AlonzoTransaction) IsValid() bool {
+	return t.IsTxValid
 }
 
 func (t *AlonzoTransaction) Cbor() []byte {
@@ -287,6 +297,44 @@ func (t *AlonzoTransaction) Cbor() []byte {
 
 func (t *AlonzoTransaction) Utxorpc() *utxorpc.Tx {
 	return t.Body.Utxorpc()
+}
+
+type ExUnit struct {
+	cbor.StructAsArray
+	Mem   uint
+	Steps uint
+}
+
+type ExUnitPrice struct {
+	cbor.StructAsArray
+	MemPrice  uint
+	StepPrice uint
+}
+
+type AlonzoProtocolParameters struct {
+	MaryProtocolParameters
+	MinPoolCost          uint
+	AdaPerUtxoByte       uint
+	CostModels           uint
+	ExecutionCosts       uint
+	MaxTxExUnits         uint
+	MaxBlockExUnits      uint
+	MaxValueSize         uint
+	CollateralPercentage uint
+	MaxCollateralInputs  uint
+}
+
+type AlonzoProtocolParameterUpdate struct {
+	MaryProtocolParameterUpdate
+	MinPoolCost          uint              `cbor:"16,keyasint"`
+	AdaPerUtxoByte       uint              `cbor:"17,keyasint"`
+	CostModels           map[string][]uint `cbor:"18,keyasint"`
+	ExecutionCosts       *ExUnitPrice      `cbor:"19,keyasint"`
+	MaxTxExUnits         *ExUnit           `cbor:"20,keyasint"`
+	MaxBlockExUnits      *ExUnit           `cbor:"21,keyasint"`
+	MaxValueSize         uint              `cbor:"22,keyasint"`
+	CollateralPercentage uint              `cbor:"23,keyasint"`
+	MaxCollateralInputs  uint              `cbor:"24,keyasint"`
 }
 
 func NewAlonzoBlockFromCbor(data []byte) (*AlonzoBlock, error) {

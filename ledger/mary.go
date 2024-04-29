@@ -39,7 +39,7 @@ type MaryBlock struct {
 	cbor.DecodeStoreCbor
 	Header                 *MaryBlockHeader
 	TransactionBodies      []MaryTransactionBody
-	TransactionWitnessSets []ShelleyTransactionWitnessSet
+	TransactionWitnessSets []MaryTransactionWitnessSet
 	TransactionMetadataSet map[uint]*cbor.Value
 }
 
@@ -72,14 +72,13 @@ func (b *MaryBlock) Era() Era {
 }
 
 func (b *MaryBlock) Transactions() []Transaction {
-	ret := []Transaction{}
+	ret := make([]Transaction, len(b.TransactionBodies))
 	for idx := range b.TransactionBodies {
-		tmpTransaction := MaryTransaction{
+		ret[idx] = &MaryTransaction{
 			Body:       b.TransactionBodies[idx],
 			WitnessSet: b.TransactionWitnessSets[idx],
 			TxMetadata: b.TransactionMetadataSet[uint(idx)],
 		}
-		ret = append(ret, &tmpTransaction)
 	}
 	return ret
 }
@@ -116,6 +115,11 @@ func (h *MaryBlockHeader) Era() Era {
 
 type MaryTransactionBody struct {
 	AllegraTransactionBody
+	Update struct {
+		cbor.StructAsArray
+		ProtocolParamUpdates map[Blake2b224]MaryProtocolParameterUpdate
+		Epoch                uint64
+	} `cbor:"6,keyasint,omitempty"`
 	TxOutputs []MaryTransactionOutput        `cbor:"1,keyasint,omitempty"`
 	Mint      MultiAsset[MultiAssetTypeMint] `cbor:"9,keyasint,omitempty"`
 }
@@ -137,8 +141,14 @@ type MaryTransaction struct {
 	cbor.StructAsArray
 	cbor.DecodeStoreCbor
 	Body       MaryTransactionBody
-	WitnessSet ShelleyTransactionWitnessSet
+	WitnessSet MaryTransactionWitnessSet
 	TxMetadata *cbor.Value
+}
+
+type MaryTransactionWitnessSet struct {
+	ShelleyTransactionWitnessSet
+	Script        []interface{} `cbor:"4,keyasint,omitempty"`
+	PlutusScripts []interface{} `cbor:"5,keyasint,omitempty"`
 }
 
 func (t MaryTransaction) Hash() string {
@@ -161,8 +171,16 @@ func (t MaryTransaction) TTL() uint64 {
 	return t.Body.TTL()
 }
 
+func (t MaryTransaction) ReferenceInputs() []TransactionInput {
+	return t.Body.ReferenceInputs()
+}
+
 func (t MaryTransaction) Metadata() *cbor.Value {
 	return t.TxMetadata
+}
+
+func (t MaryTransaction) IsValid() bool {
+	return true
 }
 
 func (t *MaryTransaction) Cbor() []byte {
@@ -266,6 +284,14 @@ func (v *MaryTransactionOutputValue) MarshalCBOR() ([]byte, error) {
 	} else {
 		return cbor.EncodeGeneric(v)
 	}
+}
+
+type MaryProtocolParameters struct {
+	AllegraProtocolParameters
+}
+
+type MaryProtocolParameterUpdate struct {
+	AllegraProtocolParameterUpdate
 }
 
 func NewMaryBlockFromCbor(data []byte) (*MaryBlock, error) {

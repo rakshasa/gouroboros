@@ -1,4 +1,4 @@
-// Copyright 2023 Blink Labs Software
+// Copyright 2024 Blink Labs Software
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,24 +16,33 @@ package txsubmission
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/blinklabs-io/gouroboros/protocol"
 )
 
+// Server implements the TxSubmission server
 type Server struct {
 	*protocol.Protocol
 	config                 *Config
+	callbackContext        CallbackContext
 	ackCount               int
 	stateDone              bool
 	requestTxIdsResultChan chan []TxIdAndSize
 	requestTxsResultChan   chan []TxBody
+	onceStart              sync.Once
 }
 
+// NewServer returns a new TxSubmission server object
 func NewServer(protoOptions protocol.ProtocolOptions, cfg *Config) *Server {
 	s := &Server{
 		config:                 cfg,
 		requestTxIdsResultChan: make(chan []TxIdAndSize),
 		requestTxsResultChan:   make(chan []TxBody),
+	}
+	s.callbackContext = CallbackContext{
+		Server:       s,
+		ConnectionId: protoOptions.ConnectionId,
 	}
 	protoConfig := protocol.ProtocolConfig{
 		Name:                ProtocolName,
@@ -48,13 +57,19 @@ func NewServer(protoOptions protocol.ProtocolOptions, cfg *Config) *Server {
 		InitialState:        stateInit,
 	}
 	s.Protocol = protocol.New(protoConfig)
-	// Start goroutine to cleanup resources on protocol shutdown
-	go func() {
-		<-s.Protocol.DoneChan()
-		close(s.requestTxIdsResultChan)
-		close(s.requestTxsResultChan)
-	}()
 	return s
+}
+
+func (s *Server) Start() {
+	s.onceStart.Do(func() {
+		s.Protocol.Start()
+		// Start goroutine to cleanup resources on protocol shutdown
+		go func() {
+			<-s.Protocol.DoneChan()
+			close(s.requestTxIdsResultChan)
+			close(s.requestTxsResultChan)
+		}()
+	})
 }
 
 func (s *Server) messageHandler(msg protocol.Message) error {
@@ -78,6 +93,7 @@ func (s *Server) messageHandler(msg protocol.Message) error {
 	return err
 }
 
+// RequestTxIds requests the next set of TX identifiers from the remote node's mempool
 func (s *Server) RequestTxIds(
 	blocking bool,
 	reqCount int,
@@ -99,6 +115,7 @@ func (s *Server) RequestTxIds(
 	return txIds, nil
 }
 
+// RequestTxs requests the content of the requested TX identifiers from the remote node's mempool
 func (s *Server) RequestTxs(txIds []TxId) ([]TxBody, error) {
 	if s.stateDone {
 		return nil, protocol.ProtocolShuttingDownError
@@ -141,5 +158,5 @@ func (s *Server) handleInit() error {
 		)
 	}
 	// Call the user callback function
-	return s.config.InitFunc()
+	return s.config.InitFunc(s.callbackContext)
 }

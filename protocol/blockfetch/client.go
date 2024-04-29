@@ -1,4 +1,4 @@
-// Copyright 2023 Blink Labs Software
+// Copyright 2024 Blink Labs Software
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,10 +28,12 @@ import (
 type Client struct {
 	*protocol.Protocol
 	config               *Config
+	callbackContext      CallbackContext
 	blockChan            chan ledger.Block
 	startBatchResultChan chan error
 	busyMutex            sync.Mutex
 	blockUseCallback     bool
+	onceStart            sync.Once
 	onceStop             sync.Once
 }
 
@@ -44,6 +46,10 @@ func NewClient(protoOptions protocol.ProtocolOptions, cfg *Config) *Client {
 		config:               cfg,
 		blockChan:            make(chan ledger.Block),
 		startBatchResultChan: make(chan error),
+	}
+	c.callbackContext = CallbackContext{
+		Client:       c,
+		ConnectionId: protoOptions.ConnectionId,
 	}
 	// Update state map with timeouts
 	stateMap := StateMap.Copy()
@@ -69,13 +75,19 @@ func NewClient(protoOptions protocol.ProtocolOptions, cfg *Config) *Client {
 		InitialState:        StateIdle,
 	}
 	c.Protocol = protocol.New(protoConfig)
-	// Start goroutine to cleanup resources on protocol shutdown
-	go func() {
-		<-c.Protocol.DoneChan()
-		close(c.blockChan)
-		close(c.startBatchResultChan)
-	}()
 	return c
+}
+
+func (c *Client) Start() {
+	c.onceStart.Do(func() {
+		c.Protocol.Start()
+		// Start goroutine to cleanup resources on protocol shutdown
+		go func() {
+			<-c.Protocol.DoneChan()
+			close(c.blockChan)
+			close(c.startBatchResultChan)
+		}()
+	})
 }
 
 func (c *Client) Stop() error {
@@ -179,7 +191,7 @@ func (c *Client) handleBlock(msgGeneric protocol.Message) error {
 	}
 	// We use the callback when requesting ranges and the internal channel for a single block
 	if c.blockUseCallback {
-		if err := c.config.BlockFunc(blk); err != nil {
+		if err := c.config.BlockFunc(c.callbackContext, blk); err != nil {
 			return err
 		}
 	} else {
