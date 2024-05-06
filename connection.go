@@ -223,9 +223,16 @@ func (c *Connection) ProtocolVersion() (uint16, protocol.VersionData) {
 
 // shutdown performs cleanup operations when the connection is shutdown, either due to explicit Close() or an error
 func (c *Connection) shutdown() {
+	// Immediately close the chainsync client
+	if c.chainSync != nil {
+		c.chainSync.Client.Close()
+	}
 	// Gracefully stop the muxer
 	if c.muxer != nil {
 		c.muxer.Stop()
+	}
+	if c.chainSync != nil {
+		c.chainSync.Client.Stop()
 	}
 	// Wait for other goroutines to finish
 	c.waitGroup.Wait()
