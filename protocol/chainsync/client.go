@@ -44,7 +44,6 @@ type Client struct {
 	wantCurrentTipChan                chan chan<- Tip
 	wantFirstBlockChan                chan chan<- clientPointResult
 	wantIntersectFoundChan            chan chan<- clientPointResult
-	wantRollbackChan                  chan chan<- Tip
 }
 
 type clientFindIntersectRequest struct {
@@ -119,7 +118,6 @@ func NewClient(stateContext interface{}, protoOptions protocol.ProtocolOptions, 
 		wantCurrentTipChan:     make(chan chan<- Tip),
 		wantFirstBlockChan:     make(chan chan<- clientPointResult, 1),
 		wantIntersectFoundChan: make(chan chan<- clientPointResult, 1),
-		wantRollbackChan:       make(chan chan<- Tip, 1),
 	}
 	c.callbackContext = CallbackContext{
 		Client:       c,
@@ -496,6 +494,25 @@ func (c *Client) sendReadyForNextBlock(ready bool) error {
 	}
 }
 
+// wantCurrentTip sends a request to the client to get the current tip, using an intermediary
+// channel to avoid missing the response in case of race conditions.
+func (c *Client) wantCurrentTip() <-chan Tip {
+	resultChan := make(chan Tip, 1)
+
+	go func() {
+		ch := make(chan Tip, 1)
+
+		select {
+		case <-c.clientDoneChan:
+			return
+		case c.wantCurrentTipChan <- ch:
+			resultChan <- <-ch
+		}
+	}()
+
+	return resultChan
+}
+
 // wantFirstBlock returns a channel that will receive the first block after the current tip, and a
 // function that can be used to clear the channel if sending the request message fails.
 func (c *Client) wantFirstBlock() (<-chan clientPointResult, func()) {
@@ -526,24 +543,6 @@ func (c *Client) wantIntersectFound() (<-chan clientPointResult, func()) {
 		return ch, func() {
 			select {
 			case <-c.wantIntersectFoundChan:
-			default:
-			}
-		}
-	}
-}
-
-// wantRollback returns a channel that will receive the result of the next rollback request, and a
-// function that can be used to clear the channel if sending the request message fails.
-func (c *Client) wantRollback() (<-chan Tip, func()) {
-	ch := make(chan Tip, 1)
-
-	select {
-	case <-c.clientDoneChan:
-		return nil, func() {}
-	case c.wantRollbackChan <- ch:
-		return ch, func() {
-			select {
-			case <-c.wantRollbackChan:
 			default:
 			}
 		}
@@ -604,18 +603,12 @@ func (c *Client) requestGetAvailableBlockRange(
 	// in a rollback.
 	//
 	// TODO: Verify that the rollback always happends, if not review the code here.
-	rollbackChan, cancelRollback := c.wantRollback()
-	if rollbackChan == nil {
-		return clientGetAvailableBlockRangeResult{error: protocol.ProtocolShuttingDownError}
-	}
+	currentTipChan := c.wantCurrentTip()
 	firstBlockChan, cancelFirstBlock := c.wantFirstBlock()
 	if firstBlockChan == nil {
 		return clientGetAvailableBlockRangeResult{error: protocol.ProtocolShuttingDownError}
 	}
 	defer func() {
-		if rollbackChan != nil {
-			cancelRollback()
-		}
 		if firstBlockChan != nil {
 			cancelFirstBlock()
 		}
@@ -636,8 +629,8 @@ func (c *Client) requestGetAvailableBlockRange(
 		select {
 		case <-c.clientDoneChan:
 			return clientGetAvailableBlockRangeResult{start: start, end: end, error: protocol.ProtocolShuttingDownError}
-		case tip := <-rollbackChan:
-			rollbackChan = nil
+		case tip := <-currentTipChan:
+			currentTipChan = nil
 			end = tip.Point
 
 			fmt.Printf("requestGetAvailableBlockRange: rollback received: %v\n", tip)
@@ -666,7 +659,7 @@ func (c *Client) requestGetAvailableBlockRange(
 				return clientGetAvailableBlockRangeResult{start: start, end: end, error: err}
 			}
 		}
-		if firstBlockChan == nil && rollbackChan == nil {
+		if currentTipChan == nil && firstBlockChan == nil {
 			break
 		}
 	}
@@ -839,12 +832,6 @@ func (c *Client) handleRollBackward(msg protocol.Message) error {
 	fmt.Printf("handleRolling back to %v\n", msgRollBackward.Point)
 
 	c.sendCurrentTip(msgRollBackward.Tip)
-
-	select {
-	case ch := <-c.wantRollbackChan:
-		ch <- msgRollBackward.Tip
-	default:
-	}
 
 	if len(c.wantFirstBlockChan) == 0 {
 		if c.config.RollBackwardFunc == nil {
