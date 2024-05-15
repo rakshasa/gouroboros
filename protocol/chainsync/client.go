@@ -346,6 +346,10 @@ func (c *Client) requestHandlerLoop() {
 				return
 			}
 
+			// TODO: Disabling request find intersect / get available block range when syncing?
+			// Review this as it seems strange to allow find intersect requests while syncing as
+			// that seems it would interfere with the sync operation.
+
 			// Disable requests that aren't allowed during syncing. (Review this)
 			isSyncing = true
 			requestFindIntersectChan = nil
